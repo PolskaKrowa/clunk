@@ -95,11 +95,15 @@ public:
     const std::vector<std::shared_ptr<BasicBlock>>& blocks() const { return blocks_; }
     std::vector<std::shared_ptr<BasicBlock>>& blocks() { return blocks_; }
 
-    // Attributes
+    // Attributes (key-value, e.g. kernel)
     void set_attribute(const std::string& key, const std::string& val) {
         attrs_[key] = val;
     }
     const std::unordered_map<std::string, std::string>& attributes() const { return attrs_; }
+
+    // Function attribute strings (nounwind, noinline, #0, etc.)
+    void add_function_attribute(const std::string& attr) { function_attributes_.push_back(attr); }
+    const std::vector<std::string>& function_attributes() const { return function_attributes_; }
 
     // Build predecessor info for all blocks
     void compute_predecessors();
@@ -139,6 +143,7 @@ private:
     std::vector<std::shared_ptr<BasicBlock>> blocks_;
     std::unordered_map<std::string, size_t> block_index_;
     std::unordered_map<std::string, std::string> attrs_;
+    std::vector<std::string> function_attributes_;
 };
 
 } // namespace clunk::ir

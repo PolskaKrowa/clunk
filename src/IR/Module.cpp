@@ -54,8 +54,11 @@ size_t Module::instruction_count() const {
 // Render the complete module as LLVM IR text:
 //
 //   ; ModuleID = 'module_name'
+//   source_filename = "..."
 //   target triple = "x86_64-unknown-linux-gnu"
 //   target datalayout = "e-m:e-..."
+//
+//   !llvm.module.flags = !{ ... }
 //
 //   declare i32 @external_func(i32)
 //
@@ -72,6 +75,13 @@ std::string Module::to_string() const {
     s.append(name_);
     s.append("'\n");
 
+    // Source filename
+    if (!source_filename_.empty()) {
+        s.append("source_filename = \"");
+        s.append(source_filename_);
+        s.append("\"\n");
+    }
+
     // Target information
     if (has_target()) {
         if (!target_.triple.empty()) {
@@ -84,6 +94,33 @@ std::string Module::to_string() const {
             s.append(target_.datalayout);
             s.append("\"\n");
         }
+    }
+
+    // Module flags — required for clang to determine PIC mode, code model, etc.
+    // LLVM IR syntax:
+    //   !0 = !{ i32 1, !"PIC Level", i32 2 }
+    //   !llvm.module.flags = !{ !0, !1 }
+    if (!module_flags_.empty()) {
+        s.append("\n");
+        for (size_t i = 0; i < module_flags_.size(); ++i) {
+            const auto& mf = module_flags_[i];
+            s.append("!");
+            s.append(std::to_string(i));
+            s.append(" = !{ i32 ");
+            s.append(std::to_string(mf.behavior));
+            s.append(", !\"");
+            s.append(mf.key);
+            s.append("\", ");
+            s.append(mf.value);
+            s.append(" }\n");
+        }
+        s.append("!llvm.module.flags = !{");
+        for (size_t i = 0; i < module_flags_.size(); ++i) {
+            if (i > 0) s.append(", ");
+            s.append(" !");
+            s.append(std::to_string(i));
+        }
+        s.append(" }\n");
     }
 
     // Named types

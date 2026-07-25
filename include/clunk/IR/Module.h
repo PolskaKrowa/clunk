@@ -37,6 +37,12 @@ struct GlobalValue {
     unsigned alignment = 0;
 };
 
+struct ModuleFlag {
+    unsigned behavior;  // 1=max, 2=min, 3=warning, 4=require, 5=override
+    std::string key;
+    std::string value;   // could be i32 value or string
+};
+
 struct TargetInfo {
     std::string triple;       // e.g. "x86_64-unknown-linux-gnu"
     std::string datalayout;   // e.g. "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
@@ -82,6 +88,14 @@ public:
     const TargetInfo& target() const { return target_; }
     bool has_target() const { return !target_.triple.empty(); }
 
+    // Source filename (from `source_filename = "..."`)
+    void set_source_filename(const std::string& sf) { source_filename_ = sf; }
+    const std::string& source_filename() const { return source_filename_; }
+
+    // Module flags (from `!llvm.module.flags`)
+    void add_module_flag(const ModuleFlag& flag) { module_flags_.push_back(flag); }
+    const std::vector<ModuleFlag>& module_flags() const { return module_flags_; }
+
     // Type context
     TypeContext& type_context() { return type_ctx_; }
 
@@ -107,6 +121,8 @@ private:
     std::unordered_map<std::string, size_t> fn_index_;
     std::vector<GlobalValue> globals_;
     TargetInfo target_;
+    std::string source_filename_;
+    std::vector<ModuleFlag> module_flags_;
     TypeContext type_ctx_;
     std::unordered_map<std::string, std::shared_ptr<Type>> named_types_;
 };

@@ -108,6 +108,11 @@ private:
     void skip_balanced(char open, char close); // skip balanced parens/braces/brackets
     void skip_param_attrs();            // skip parameter attributes before a type
     void skip_function_attrs_until_brace(); // skip function attrs between ) and {
+    std::vector<std::string> collect_function_attrs(); // collect function attrs between ) and {
+
+    // ── Module-level metadata parsing ───────────────────────────────────
+    void parse_llvm_module_flags(std::shared_ptr<ir::Module> mod);
+    bool try_parse_module_flag_entry(std::shared_ptr<ir::Module> mod);
 
     // ── State ───────────────────────────────────────────────────────────
     std::vector<Token> tokens_;

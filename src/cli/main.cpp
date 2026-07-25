@@ -147,6 +147,7 @@ static void print_usage(const char* prog) {
               << "                            above --max-function-size (default 8192; 0 = disable)\n"
               << "  --cache-path <path>       Persistent SMT rewrite cache (file-backed LRU)\n"
               << "  --no-honor-binop-flags    Ignore nsw/nuw/exact flags in SMT encoding (sound fallback)\n"
+              << "\n"
               << "  --version                 Print version\n"
               << "  --help                    Print this help\n"
               << "\n";

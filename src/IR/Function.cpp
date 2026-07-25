@@ -41,21 +41,10 @@ static const char* linkage_name(Linkage l) {
 }
 
 // ── compute_predecessors() ───────────────────────────────────────────────
-// Rebuild predecessor lists for every basic block in this function.
-//
-// Algorithm:
-//   1. Clear all predecessor lists.
-//   2. For each block B, inspect its terminator to get successor labels.
-//   3. For each successor S, look up the block and add B's name as a
-//      predecessor of S.
-//
 void Function::compute_predecessors() {
-    // Step 1: Clear all predecessor lists
     for (auto& bb : blocks_) {
         bb->clear_predecessors();
     }
-
-    // Step 2–3: Walk every block and wire predecessor edges
     for (const auto& bb : blocks_) {
         auto succs = bb->successors();
         for (const auto& succ_name : succs) {
@@ -68,7 +57,6 @@ void Function::compute_predecessors() {
 }
 
 // ── instruction_count() ─────────────────────────────────────────────────
-// Sum of all instructions across every basic block.
 size_t Function::instruction_count() const {
     size_t count = 0;
     for (const auto& bb : blocks_) {
@@ -78,23 +66,14 @@ size_t Function::instruction_count() const {
 }
 
 // ── to_string() ─────────────────────────────────────────────────────────
-// Render the function in LLVM IR textual form:
-//
-//   define i32 @func_name(i32 %arg0, i32 %arg1) {
-//   entry:
-//     ...
-//   bb1:
-//     ...
-//   }
-//
 std::string Function::to_string() const {
     std::string s;
     s.reserve(256);
 
-    // Linkage keyword (empty for external, which is the default)
+    // Linkage keyword
     s.append(linkage_name(linkage_));
 
-    // "define <return_type> @<name>(<args>) {"
+    // "define <return_type> @<name>(<args>)<attrs> {"
     s.append("define ");
     s.append(fn_type_->return_type()->to_string());
     s.append(" @");
@@ -117,7 +96,15 @@ std::string Function::to_string() const {
         s.append("...");
     }
 
-    s.append(") {\n");
+    s.append(")");
+
+    // Function attributes
+    for (const auto& attr : function_attributes_) {
+        s.append(" ");
+        s.append(attr);
+    }
+
+    s.append(" {\n");
 
     // Basic blocks
     for (const auto& bb : blocks_) {

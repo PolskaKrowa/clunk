@@ -19,7 +19,7 @@
  * Clunk Evolutionary Search — population-based optimisation with
  * crossover and mutation. Escapes local optima that stochastic search
  * can get stuck in.
- */
+ *
 #include "clunk/Search/EvolutionarySearch.h"
 #include "clunk/Search/StochasticSearch.h"
 #include "clunk/IR/Clone.h"
