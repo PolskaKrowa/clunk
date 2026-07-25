@@ -1,0 +1,1316 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Clunk — LLVM IR superoptimiser
+// Copyright (C) 2025 Clunk contributors
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+/*
+ * Clunk Pipeline — orchestrates the full optimisation pipeline:
+ * Pattern Library → Stochastic Search → Evolutionary Search → SMT Verify
+ */
+#include "clunk/Pipeline.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cmath>
+#include <iostream>
+#include <limits>
+#include <thread>
+#include <unordered_set>
+
+#include "clunk/Evaluator/CostModel.h"
+#include "clunk/IR/DataflowPrune.h"
+#include "clunk/IR/LoopAnalysis.h"
+#include "clunk/IR/Scalarizer.h"
+#include "clunk/Search/Inliner.h"
+#include "clunk/Search/LoopOpt.h"
+#include "clunk/Search/MemOpt.h"
+#include "clunk/Search/VectorSynth.h"
+
+#ifdef CLUNK_HAS_GPU
+#include "clunk/GPU/PTXOptimizer.h"
+#endif
+
+namespace clunk {
+
+// ── Anonymous-namespace helpers ─────────────────────────────────────────────
+
+// Count total instructions across all basic blocks of a function. Used by
+// the function-size gate and the search-budget scaling.
+namespace {
+size_t count_instructions(const ir::Function& fn) {
+    size_t count = 0;
+    for (auto& block : fn.blocks()) {
+        if (block) count += block->size();
+    }
+    return count;
+}
+} // namespace
+
+// ── Constructor ─────────────────────────────────────────────────────────────
+
+Pipeline::Pipeline(const PipelineConfig& config)
+    : config_(config),
+      eval_engine_(),
+      searchers_(config, &eval_engine_),
+      pattern_lib_()
+{
+    // Propagate target_arch to the evaluator via a per-architecture
+    // CostModel.
+    auto cost_model = evaluator::make_cost_model_for_name(config_.target_arch.name);
+    eval_engine_.set_cost_model(cost_model);
+
+    // Load pattern library from disk if a path was provided
+    if (!config.pattern_library_path.empty()) {
+        if (!pattern_lib_.load(config.pattern_library_path)) {
+            // Library file didn't exist or was unreadable — seed built-ins
+            // already happened in the constructor.
+        }
+    }
+
+    // ── Persistent SMT rewrite cache ──────────────────────────────
+    // Open the file-backed cache and warm it up. The shared_ptr is plumbed
+    // into each worker's SMTVerifier via SMTConfig::cache (see the worker
+    // lambda in run()). The cache is thread-safe (mutex-guarded).
+    if (!config_.smt_cache_path.empty()) {
+        rewrite_cache_ = std::make_shared<search::RewriteCache>();
+        if (rewrite_cache_->open_file(config_.smt_cache_path)) {
+            rewrite_cache_->warmup();
+            // Wire it into the shared sequential SMTVerifier. Worker threads
+            // create their own SMTVerifier but inherit the same SMTConfig
+            // (and thus the same cache shared_ptr).
+            searchers_.smt.config().cache = rewrite_cache_;
+        } else {
+            // File couldn't be opened — disable caching for this run.
+            rewrite_cache_.reset();
+        }
+    }
+
+    // ── STOKE-style moves + test-vector pre-filter ────────────────
+    // Propagate the pipeline-level flags into the stochastic search config
+    // so both the sequential and per-worker StochasticSearch instances pick
+    // them up (the Searchers ctor copies the config by value).
+    searchers_.stochastic.config().allow_unsound_mutations =
+        config_.allow_unsound_mutations;
+    searchers_.stochastic.config().test_vector_count =
+        config_.test_vector_count;
+}
+
+// ── Deadline bookkeeping ────────────────────────────────────────────────────
+
+double Pipeline::remaining_seconds() const {
+    if (!has_deadline_) return std::numeric_limits<double>::infinity();
+    return std::chrono::duration<double>(
+               deadline_ - std::chrono::steady_clock::now()).count();
+}
+
+// ── run ─────────────────────────────────────────────────────────────────────
+
+PipelineResult Pipeline::run(const ir::Module& module) {
+    PipelineResult result;
+    auto start = std::chrono::high_resolution_clock::now();
+
+    // Arm the shared wall-clock deadline. run_on_function() and the search
+    // phases derive their per-round budgets from it.
+    if (config_.time_budget > 0.0) {
+        deadline_ = std::chrono::steady_clock::now() +
+                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                        std::chrono::duration<double>(config_.time_budget));
+        has_deadline_ = true;
+    } else {
+        has_deadline_ = false;
+    }
+
+    // Create the optimised module (deep copy)
+    result.optimised_module = std::make_shared<ir::Module>(module.name());
+    // Copy target info
+    if (module.has_target()) {
+        result.optimised_module->set_target(module.target());
+    }
+
+    // Functions to process, in module order (independent — safe to optimise in
+    // parallel). Results are indexed by position so the output module keeps
+    // module order regardless of completion order.
+    std::vector<const ir::Function*> fns;
+    for (auto& fn : module.functions())
+        if (fn) fns.push_back(fn.get());
+    const size_t total_fns = fns.size();
+    std::vector<PipelineResult::FunctionResult> fn_results(total_fns);
+
+    // Optimise fns[i] with the given per-thread search state, or pass it
+    // through unchanged when the wall-clock budget is exhausted.
+    auto process = [&](size_t i, Searchers& s) {
+        const ir::Function& fn = *fns[i];
+        report_progress("pipeline", fn.name(),
+                        static_cast<double>(i) / static_cast<double>(total_fns));
+        if (has_deadline_ && remaining_seconds() <= 0.0) {
+            PipelineResult::FunctionResult r;
+            r.function_name = fn.name();
+            r.original = std::make_shared<ir::Function>(fn);
+            r.optimised = std::make_shared<ir::Function>(fn);
+            r.score_original = eval_engine_.analyse(fn).score;
+            r.score_optimised = r.score_original;
+            r.improvement_ratio = 1.0;
+            fn_results[i] = std::move(r);
+            return;
+        }
+
+        // ── Interprocedural pre-pass: inline small single-block callees.
+        // Exact by construction and cost-gated. Beyond the direct win, it
+        // removes opaque calls — the refinement chain then anchors SMT
+        // verification on the inlined body, which (unlike the original)
+        // the prover can actually model.
+        std::shared_ptr<ir::Function> inlined;
+        if (config_.enable_inliner && config_.opt_level >= 1) {
+            search::Inliner inliner;
+            inlined = inliner.inline_calls(fn, module);
+            if (inlined &&
+                !(eval_engine_.score_candidate(fn, *inlined) > 1.0)) {
+                inlined = nullptr;  // not a win — keep the original
+            }
+            if (inlined && config_.verbose) {
+                std::cerr << "  [inline] " << fn.name() << ": inlined "
+                          << inliner.stats().call_sites_inlined
+                          << " call site(s)\n";
+            }
+        }
+
+        fn_results[i] = run_on_function(inlined ? *inlined : fn, s);
+
+        // Report honestly against the TRUE original when inlining changed
+        // the baseline run_on_function saw.
+        if (inlined) {
+            auto& r = fn_results[i];
+            r.original = std::make_shared<ir::Function>(fn);
+            r.score_original = eval_engine_.analyse(fn).score;
+            r.improvement_ratio =
+                eval_engine_.score_candidate(fn, *r.optimised);
+        }
+    };
+
+    // Worker count: 0 = auto (hardware_concurrency), clamped to [1,32] and to
+    // the number of functions. 1 = sequential (deterministic).
+    size_t nthreads = config_.num_threads;
+    if (nthreads == 0) {
+        nthreads = std::thread::hardware_concurrency();
+        if (nthreads == 0) nthreads = 1;
+        if (nthreads > 32) nthreads = 32;
+    }
+    if (total_fns > 0) nthreads = std::min(nthreads, total_fns);
+
+    if (nthreads <= 1) {
+        for (size_t i = 0; i < total_fns; ++i) process(i, searchers_);
+    } else {
+        // Each worker pulls the next function index and optimises it with its
+        // OWN search state. The evaluator (thread-safe cache) and pattern
+        // library (read-only) are shared.
+        std::atomic<size_t> next{0};
+        auto worker = [&]() {
+            Searchers local(config_, &eval_engine_);
+            // Propagate the shared rewrite cache and STOKE-style
+            // search flags to this worker's SMTVerifier / search.
+            if (rewrite_cache_) {
+                local.smt.config().cache = rewrite_cache_;
+            }
+            local.stochastic.config().allow_unsound_mutations =
+                config_.allow_unsound_mutations;
+            local.stochastic.config().test_vector_count =
+                config_.test_vector_count;
+            for (;;) {
+                size_t i = next.fetch_add(1);
+                if (i >= total_fns) break;
+                process(i, local);
+            }
+        };
+        std::vector<std::thread> workers;
+        workers.reserve(nthreads);
+        for (size_t t = 0; t < nthreads; ++t) workers.emplace_back(worker);
+        for (auto& w : workers) w.join();
+        if (config_.verbose) {
+            std::cerr << "  [parallel] optimised " << total_fns << " function(s) across "
+                      << nthreads << " threads\n";
+        }
+    }
+
+    // Assemble the output module in module order.
+    for (size_t i = 0; i < total_fns; ++i) {
+        result.function_results[fns[i]->name()] = fn_results[i];
+        result.optimised_module->add_function(
+            fn_results[i].optimised ? fn_results[i].optimised
+                                    : std::make_shared<ir::Function>(*fns[i]));
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    result.total_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
+    result.total_functions_processed = result.function_results.size();
+
+    // Compute aggregate statistics
+    double total_improvement = 0.0;
+    size_t improved_count = 0;
+    for (auto& [name, fr] : result.function_results) {
+        if (fr.improvement_ratio > 1.0) {
+            total_improvement += fr.improvement_ratio;
+            ++improved_count;
+        }
+    }
+    result.total_optimised = improved_count;
+    result.avg_improvement = (improved_count > 0)
+        ? total_improvement / static_cast<double>(improved_count)
+        : 1.0;
+
+    // Copy globals to the output module
+    for (auto& gv : module.globals()) {
+        result.optimised_module->add_global(gv);
+    }
+
+    report_progress("pipeline", "done", 1.0);
+
+    // Disarm the deadline so later direct run_on_function() calls arm
+    // their own fresh budget.
+    has_deadline_ = false;
+
+    return result;
+}
+
+// ── run_on_function ─────────────────────────────────────────────────────────
+
+PipelineResult::FunctionResult Pipeline::run_on_function(const ir::Function& fn) {
+    // Public entry point: use the shared sequential search state.
+    return run_on_function(fn, searchers_);
+}
+
+PipelineResult::FunctionResult Pipeline::run_on_function(const ir::Function& fn,
+                                                         Searchers& s) {
+    PipelineResult::FunctionResult result;
+    result.function_name = fn.name();
+    result.original = std::make_shared<ir::Function>(fn);
+
+    // Declarations (no body) have nothing to optimise — pass through
+    // without burning search rounds on them (clang modules typically
+    // declare a handful of intrinsics).
+    if (fn.blocks().empty()) {
+        result.optimised = std::make_shared<ir::Function>(fn);
+        result.improvement_ratio = 1.0;
+        return result;
+    }
+
+    // ── Function-size gate ────────────────────────────────────────
+    // The mutation search's cost is super-linear in function size and the
+    // SMT encoding goes exponential on branch-heavy CFGs, so functions above
+    // max_function_size don't get the full search stack. But slice
+    // HARVESTING scales linearly, so instead of passing such functions
+    // through entirely untouched, they get a miner-only refinement path.
+    // Whole-function SMT re-verification cannot model functions this large,
+    // so miner wins are only adoptable when the user opted into
+    // trust_unverified; without it (or above the mining cap) the function
+    // is passed through unchanged. Sound either way: we never emit an
+    // unproven candidate beyond what the trust level allows.
+    const size_t inst_count = count_instructions(fn);
+    const size_t SKIP_THRESHOLD = config_.max_function_size;
+    const bool oversized = inst_count > SKIP_THRESHOLD;
+    if (oversized) {
+        const bool miner_can_run =
+            config_.opt_level >= 2 && config_.enable_peephole_miner &&
+            !config_.skip_smt && search::SMTVerifier::is_z3_available() &&
+            config_.max_mining_function_size > 0 &&
+            inst_count <= config_.max_mining_function_size &&
+            (config_.trust_unverified ||
+             (inst_count <= config_.smt_config.max_instructions_for_smt &&
+              fn.blocks().size() <= config_.smt_config.max_blocks_for_smt));
+        if (!miner_can_run) {
+            result.optimised = std::make_shared<ir::Function>(fn);
+            result.score_original = eval_engine_.analyse(fn).score;
+            result.score_optimised = result.score_original;
+            result.improvement_ratio = 1.0;
+            result.time_spent_ms = 0.0;
+            if (config_.verbose) {
+                std::cerr << "  [skip] " << fn.name() << " (" << inst_count
+                          << " instructions > " << SKIP_THRESHOLD << ")\n";
+            }
+            return result;
+        }
+        if (config_.verbose) {
+            std::cerr << "  [miner-only] " << fn.name() << " (" << inst_count
+                      << " instructions > " << SKIP_THRESHOLD
+                      << " — slice mining only)\n";
+        }
+    }
+
+    auto fn_start = std::chrono::high_resolution_clock::now();
+
+    // Reset the per-function guards.
+    s.last_mined_hash = 0;
+    s.last_egraph_hash = 0;
+    s.last_vector_hash = 0;
+    s.last_loop_hash = 0;
+    s.last_mem_hash = 0;
+    s.rejected_hashes.clear();
+
+    // Arm a local deadline if run_on_function() was called directly
+    // (not via run(), which arms the shared one).
+    bool local_deadline = false;
+    if (!has_deadline_ && config_.time_budget > 0.0) {
+        deadline_ = std::chrono::steady_clock::now() +
+                    std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                        std::chrono::duration<double>(config_.time_budget));
+        has_deadline_ = true;
+        local_deadline = true;
+    }
+
+    // Stage 1: Apply patterns from the pattern library (iteratively).
+    // Skipped on the miner-only path: pattern rewrites are adopted on the
+    // evaluator's word alone, which is a trust level the oversized path
+    // hasn't earned — the miner's per-slice SMT proofs have.
+    report_progress("patterns", fn.name(), 0.0);
+    auto after_patterns =
+        oversized ? nullptr : apply_patterns(fn, result);
+
+    // The refinement baseline: best-known-so-far version of the function.
+    std::shared_ptr<ir::Function> current =
+        after_patterns ? after_patterns : std::make_shared<ir::Function>(fn);
+
+    // ── Continuous refinement rounds (souper/minotaur style) ────────────
+    // Each round runs the full search stack from `current`, verifies the
+    // top candidates against the ORIGINAL function (the soundness anchor
+    // for the whole chain), and adopts the best improvement as the new
+    // baseline. There is no fixed optimisation cap: rounds continue until
+    // `convergence_rounds` consecutive rounds fail to improve, until
+    // `max_rounds` (if set), or until the time budget runs out.
+    if (config_.opt_level >= 2) {
+        const size_t convergence =
+            std::max<size_t>(1, config_.convergence_rounds);
+        size_t round = 0;
+        size_t stagnant = 0;
+
+        while (stagnant < convergence) {
+            if (config_.max_rounds > 0 && round >= config_.max_rounds) break;
+            // Leave a little headroom; a round that can't run for at
+            // least ~50ms won't find anything.
+            if (remaining_seconds() <= 0.05) break;
+
+            // ── Per-function time cap ─────────────────────────────────
+            // If max_time_per_function is set, stop refining this function
+            // once we've spent that long on it. This prevents one stuck
+            // function from monopolizing the budget while other functions
+            // starve.
+            if (config_.max_time_per_function > 0.0) {
+                double fn_elapsed = std::chrono::duration<double>(
+                    std::chrono::high_resolution_clock::now() - fn_start).count();
+                if (fn_elapsed >= config_.max_time_per_function) {
+                    if (config_.verbose) {
+                        std::cerr << "  [cap] " << fn.name() << ": hit per-function time cap ("
+                                  << config_.max_time_per_function << "s)\n";
+                    }
+                    break;
+                }
+            }
+
+            report_progress("round", fn.name(),
+                            1.0 - 1.0 / static_cast<double>(round + 2));
+
+            // Stage 1.5: vector-intrinsic synthesis (SMT-proved SIMD
+            // rewrites on functions containing vector operations; inert
+            // otherwise). Runs FIRST: it is deterministic and cheap (one
+            // idiom scan + one SMT proof), and on vector functions its
+            // candidate is usually the decisive one — running it after the
+            // mutation searches would let them exhaust the round budget
+            // before it ever fires.
+            auto vector_candidates = vector_phase(*current, s);
+
+            // Stage 1.6: loop optimisation (LICM + constant-trip full
+            // unrolling), Stage 1.7: alias-aware memory optimisation, and
+            // Stage 1.8: dataflow pruning (DCE + unreachable-block
+            // elimination + known-bits constant/branch folding). All
+            // three are deterministic, sound-by-construction, and cheap —
+            // and their rewrites COMPOUND with the rest of the round: an
+            // unrolled loop or a forwarded load becomes straight-line
+            // integer code the miner can then prove rewrites for, and a
+            // smaller pruned baseline is cheaper for every phase for the
+            // REST of this round and every round after.
+            {
+                auto loop_candidates = loop_phase(*current, s);
+                vector_candidates.insert(
+                    vector_candidates.end(),
+                    std::make_move_iterator(loop_candidates.begin()),
+                    std::make_move_iterator(loop_candidates.end()));
+                auto mem_candidates = mem_phase(*current, s);
+                vector_candidates.insert(
+                    vector_candidates.end(),
+                    std::make_move_iterator(mem_candidates.begin()),
+                    std::make_move_iterator(mem_candidates.end()));
+                auto prune_candidates = dataflow_prune_phase(*current, s);
+                vector_candidates.insert(
+                    vector_candidates.end(),
+                    std::make_move_iterator(prune_candidates.begin()),
+                    std::make_move_iterator(prune_candidates.end()));
+            }
+
+            // Stage 2: Stochastic search from the current baseline.
+            // (Miner-only path: the mutation search is super-linear in
+            // function size, so oversized functions skip straight to the
+            // linear-cost slice mining below.)
+            auto stochastic_candidates =
+                oversized ? std::vector<search::Candidate>{}
+                          : stochastic_phase(*current, remaining_seconds(), s);
+
+            // Stage 3: Evolutionary search seeded with stochastic results
+            auto all_candidates =
+                oversized ? std::vector<search::Candidate>{}
+                          : evolutionary_phase(*current, stochastic_candidates,
+                                               remaining_seconds(), s);
+
+            // Merge (evolutionary results first: usually higher quality)
+            all_candidates.insert(all_candidates.end(),
+                                  std::make_move_iterator(stochastic_candidates.begin()),
+                                  std::make_move_iterator(stochastic_candidates.end()));
+            stochastic_candidates.clear();
+            stochastic_candidates.shrink_to_fit();
+
+            // Stage 3.5: SMT-verified peephole mining from the current baseline.
+            // This is the lever that finds wins the mutation search (a subset of
+            // provably-cheaper integer slice rewrites.
+            auto mining_candidates = mining_phase(*current, s);
+            all_candidates.insert(all_candidates.end(),
+                                  std::make_move_iterator(mining_candidates.begin()),
+                                  std::make_move_iterator(mining_candidates.end()));
+
+            // Merge the Stage-1.5 vector-synthesis candidate (collected
+            // before the mutation searches so it cannot be starved).
+            all_candidates.insert(all_candidates.end(),
+                                  std::make_move_iterator(vector_candidates.begin()),
+                                  std::make_move_iterator(vector_candidates.end()));
+
+            // ── Equality-saturation candidate generation ──────────────
+            // Guarded by last_egraph_hash — skips re-running on an
+            // unchanged baseline (eliminates the repeated-identical-candidate
+            // pathology). Skipped on the miner-only path
+            // (e-graph lowering cost grows with function size, and its
+            // candidates are pattern-derived, not slice-proven).
+            if (!oversized) {
+                auto egraph_candidates = egraph_phase(*current, s);
+                all_candidates.insert(all_candidates.end(),
+                                      std::make_move_iterator(egraph_candidates.begin()),
+                                      std::make_move_iterator(egraph_candidates.end()));
+            }
+
+            // Stage 4: Verify against the ORIGINAL, select vs `current`
+            auto best = verify_and_select(fn, *current, all_candidates, result, s);
+
+            // Free candidate memory promptly — each candidate holds a
+            // deep copy of the function, and the next round rebuilds its
+            // own pool.
+            all_candidates.clear();
+            all_candidates.shrink_to_fit();
+
+            ++round;
+            if (best) {
+                current = best;
+                stagnant = 0;
+                ++result.improvements_adopted;
+                if (config_.verbose) {
+                    std::cerr << "  [round " << round << "] " << fn.name()
+                              << ": adopted improvement"
+                              << (result.verified ? " (verified)" : " (unverified)")
+                              << "\n";
+                }
+            } else {
+                ++stagnant;
+            }
+        }
+        result.rounds_run = round;
+    }
+
+    result.optimised = current;
+
+    if (local_deadline) has_deadline_ = false;
+
+    // Stage 5 (if GPU): GPU-specific optimisation
+#ifdef CLUNK_HAS_GPU
+    if (config_.enable_gpu_opt && result.optimised->is_gpu_kernel()) {
+        report_progress("gpu", fn.name(), 0.9);
+        auto gpu_result = gpu_optimise(*result.optimised);
+        if (gpu_result) {
+            result.optimised = gpu_result;
+        }
+    }
+#endif
+
+    auto fn_end = std::chrono::high_resolution_clock::now();
+    result.time_spent_ms = std::chrono::duration<double, std::milli>(fn_end - fn_start).count();
+
+    // Compute scores
+    auto orig_analysis = eval_engine_.analyse(fn);
+    auto opt_analysis = eval_engine_.analyse(*result.optimised);
+    result.score_original = orig_analysis.score;
+    result.score_optimised = opt_analysis.score;
+
+    // Compute the improvement ratio, sign-aware.
+    //
+    // Convention (matches EvaluationEngine::score_candidate_with_cached_orig):
+    //   ratio > 1.0 → improvement (higher score = better)
+    //   ratio < 1.0 → regression
+    //
+    // Scores usually follow score = -cost ≤ 0, where |orig|/|opt| works.
+    // But bonus-heavy functions can score POSITIVE, where |orig|/|opt|
+    // inverts the meaning (an improvement showed as ratio < 1). Handle
+    // the three sign cases explicitly; in every case ratio > 1 iff
+    // score_optimised > score_original.
+    const double so = result.score_original;
+    const double sp = result.score_optimised;
+    constexpr double EPS = 1e-9;
+    if (std::abs(sp - so) < EPS) {
+        result.improvement_ratio = 1.0;
+    } else if (so <= 0.0 && sp <= 0.0) {
+        // Both are costs: classic cost ratio.
+        double orig_abs = std::abs(so), opt_abs = std::abs(sp);
+        result.improvement_ratio =
+            (opt_abs < EPS) ? 1e6 : orig_abs / opt_abs;
+    } else if (so >= 0.0 && sp >= 0.0) {
+        // Both are bonuses: bigger is better.
+        result.improvement_ratio =
+            (so < EPS) ? 1e6 : sp / so;
+    } else {
+        // Mixed signs: map the score delta into a ratio-like number
+        // centred at 1 (monotone in the delta, bounded to (0, 2)).
+        result.improvement_ratio =
+            1.0 + (sp - so) / (std::abs(so) + std::abs(sp));
+    }
+    if (!std::isfinite(result.improvement_ratio) ||
+        result.improvement_ratio < 0.0) {
+        result.improvement_ratio = 1.0;
+    }
+
+    return result;
+}
+
+// ── apply_patterns ──────────────────────────────────────────────────────────
+
+std::shared_ptr<ir::Function> Pipeline::apply_patterns(
+    const ir::Function& fn,
+    PipelineResult::FunctionResult& result)
+{
+    if (config_.opt_level == 0) return nullptr;
+
+    // Apply patterns ITERATIVELY: after one pattern rewrites the function,
+    // new patterns may match the result. Keep applying the best match as
+    // long as the evaluator agrees it improves, up to a small cap (which
+    // also guards against A→B / B→A pattern ping-pong).
+    constexpr size_t MAX_PATTERN_PASSES = 8;
+
+    std::shared_ptr<ir::Function> current;
+    double current_score = eval_engine_.analyse(fn).score;
+
+    for (size_t pass = 0; pass < MAX_PATTERN_PASSES; ++pass) {
+        const ir::Function& base = current ? *current : fn;
+
+        auto matches = pattern_lib_.match(base, config_.target_arch);
+        if (matches.empty()) break;
+
+        // Apply the best-matching pattern (highest estimated speedup first)
+        std::sort(matches.begin(), matches.end(),
+                  [](const pattern::PatternMatch& a, const pattern::PatternMatch& b) {
+                      return a.estimated_speedup > b.estimated_speedup;
+                  });
+
+        auto& best_match = matches[0];
+        auto optimised = pattern_lib_.apply(base, best_match, config_.target_arch);
+        if (!optimised) break;
+
+        // Only keep the rewrite if the evaluator scores it strictly better
+        // (prevents ping-pong between mutually inverse patterns).
+        double new_score = eval_engine_.analyse(*optimised).score;
+        if (new_score <= current_score) break;
+
+        current = optimised;
+        current_score = new_score;
+        ++result.patterns_applied;
+        pattern_lib_.record_application(best_match.pattern_id);
+    }
+
+    return current;
+}
+
+// ── stochastic_phase ────────────────────────────────────────────────────────
+//
+// opt_level semantics (continuous-refinement era):
+//   opt_level 0 → no patterns, no search, no SMT  (cheapest; pass-through)
+//   opt_level 1 → patterns only                  (cheap; library-driven)
+//   opt_level 2 → continuous refinement rounds   (default)
+//   opt_level 3 → continuous refinement with larger per-round budgets
+//
+// The level no longer bounds how much optimisation a function receives —
+// the round loop in run_on_function keeps going until convergence or the
+// time budget runs out. The level only sizes each individual round.
+//
+// User-provided budgets are RESPECTED (capped, not overridden): the level
+// preset acts as an upper bound so the unbounded struct defaults stay
+// tractable per round, but a smaller user config wins.
+
+std::vector<search::Candidate> Pipeline::stochastic_phase(
+    const ir::Function& fn, double remaining, Searchers& s) {
+    if (config_.opt_level < 2) return {};
+    if (remaining <= 0.0) return {};
+
+    search::StochasticConfig sconfig = config_.stochastic_config;
+    const size_t iter_cap = (config_.opt_level >= 3) ? 2000 : 1000;
+    const size_t cand_cap = (config_.opt_level >= 3) ? 30 : 20;
+    sconfig.max_iterations = std::min(sconfig.max_iterations, iter_cap);
+    sconfig.max_candidates = std::min(sconfig.max_candidates, cand_cap);
+
+    // Scale the iteration / candidate counts DOWN for larger
+    // functions. Each applied mutation deep-copies the function, so
+    // per-iteration cost is O(inst_count). We scale the budget so the
+    // *total work* (iterations × inst_count) stays roughly constant.
+    const size_t inst_count = count_instructions(fn);
+    const size_t cap = config_.max_function_size > 0
+                           ? config_.max_function_size
+                           : size_t(200);
+    // scale ∈ [0.1, 1.0]: 1.0 for tiny fns, ~0.1 for fns near 4× the cap
+    // (we already skip anything >cap, so the floor at 0.1 keeps the
+    // search from becoming useless for borderline-large functions).
+    double scale = std::max(0.1, 1.0 - static_cast<double>(inst_count) /
+                                       static_cast<double>(cap * 4));
+    sconfig.max_iterations = static_cast<size_t>(
+        static_cast<double>(sconfig.max_iterations) * scale);
+    sconfig.max_candidates = static_cast<size_t>(
+        static_cast<double>(sconfig.max_candidates) * scale);
+    // Floors keep the search non-trivial, but never above what the user
+    // asked for.
+    sconfig.max_iterations = std::max(
+        sconfig.max_iterations,
+        std::min<size_t>(100, config_.stochastic_config.max_iterations));
+    sconfig.max_candidates = std::max(
+        sconfig.max_candidates,
+        std::min<size_t>(5, config_.stochastic_config.max_candidates));
+
+    // Enable stagnation restarts by default: when the SA chain stops
+    // improving for a quarter of the round's budget, re-heat and restart
+    // from the baseline. (The struct default of 0 = disabled meant this
+    // escape hatch was never used.)
+    if (sconfig.stagnation_limit == 0) {
+        sconfig.stagnation_limit = std::max<size_t>(50, sconfig.max_iterations / 4);
+    }
+
+    // Hand the phase the true remaining budget (still capped at 30s per
+    // phase so one round can't starve the rest of the module).
+    if (std::isfinite(remaining)) {
+        sconfig.time_budget_seconds = std::min(remaining, 30.0);
+    }
+
+    s.stochastic.config() = sconfig;
+    return s.stochastic.search(fn);
+}
+
+// ── evolutionary_phase ──────────────────────────────────────────────────────
+
+std::vector<search::Candidate> Pipeline::evolutionary_phase(
+    const ir::Function& fn,
+    const std::vector<search::Candidate>& stochastic_candidates,
+    double remaining, Searchers& s)
+{
+    if (config_.opt_level < 2) return {};
+    if (remaining <= 0.0) return {};
+
+    // Per-round budget caps by opt level (user-provided smaller budgets
+    // are respected; the preset is only an upper bound).
+    search::EvolutionaryConfig econfig = config_.evolutionary_config;
+    const size_t pop_cap = (config_.opt_level >= 3) ? 30 : 20;
+    const size_t gen_cap = (config_.opt_level >= 3) ? 50 : 30;
+    econfig.population_size = std::min(econfig.population_size, pop_cap);
+    econfig.max_generations = std::min(econfig.max_generations, gen_cap);
+
+    // Scale population/generation counts down for larger
+    // functions, and propagate the time budget. Each individual holds a
+    // full deep-copy of the function; keeping the population small bounds
+    // peak memory and per-generation wall-clock time.
+    const size_t inst_count = count_instructions(fn);
+    const size_t cap = config_.max_function_size > 0
+                           ? config_.max_function_size
+                           : size_t(200);
+    double scale = std::max(0.1, 1.0 - static_cast<double>(inst_count) /
+                                       static_cast<double>(cap * 4));
+    econfig.population_size = static_cast<size_t>(
+        static_cast<double>(econfig.population_size) * scale);
+    econfig.max_generations = static_cast<size_t>(
+        static_cast<double>(econfig.max_generations) * scale);
+    // Floor: at least 5 individuals / 2 generations so the search is
+    // non-trivial, but never above what the user asked for.
+    econfig.population_size = std::max(
+        econfig.population_size,
+        std::min<size_t>(5, config_.evolutionary_config.population_size));
+    econfig.max_generations = std::max(
+        econfig.max_generations,
+        std::min<size_t>(2, config_.evolutionary_config.max_generations));
+
+    if (std::isfinite(remaining)) {
+        econfig.time_budget_seconds = std::min(remaining, 30.0);
+    }
+
+    s.evolutionary.config() = econfig;
+    return s.evolutionary.search(fn, stochastic_candidates);
+}
+
+// ── mining_phase ──────────────────────────────────────────────────────────────
+
+std::vector<search::Candidate> Pipeline::mining_phase(const ir::Function& fn,
+                                                      Searchers& s) {
+    if (config_.opt_level < 2) return {};
+    if (!config_.enable_peephole_miner) return {};
+    // The miner proves each rewrite with SMT; without a real prover it would be
+    // reduced to unsound random testing, so it is disabled in that case (the
+    // whole point is a *proven* superoptimisation).
+    if (config_.skip_smt || !search::SMTVerifier::is_z3_available()) return {};
+    if (remaining_seconds() <= 0.05) return {};
+
+    // Mine each distinct baseline at most once. The miner is deterministic and
+    // applies all its non-overlapping wins in a single pass, so re-running it on
+    // an unchanged function only burns the round's budget.
+    const uint64_t h = search::StochasticSearch::structural_hash(fn);
+    if (h == s.last_mined_hash) return {};
+    s.last_mined_hash = h;
+
+    search::MinerConfig mcfg = config_.peephole_config;
+    if (config_.smt_config.timeout_ms > 0)
+        mcfg.smt_timeout_ms = config_.smt_config.timeout_ms;
+    // Hand the miner the true remaining wall-clock budget (capped like the
+    // other phases so one function can't starve the rest of the module).
+    // Without this the slice loop runs unbounded — each slice can spend
+    // many SMT calls, which on large functions blows far past the deadline.
+    const double rem = remaining_seconds();
+    if (std::isfinite(rem)) {
+        mcfg.time_budget_seconds = std::max(0.05, std::min(rem, 30.0));
+    }
+    if (config_.max_time_per_function > 0.0) {
+        mcfg.time_budget_seconds = (mcfg.time_budget_seconds > 0.0)
+            ? std::min(mcfg.time_budget_seconds, config_.max_time_per_function)
+            : config_.max_time_per_function;
+    }
+    // The miner does its own whole-function SMT re-verification (against `fn`,
+    // the current baseline), so the returned rewrite is already proven; mark it
+    // sound below rather than re-verifying in verify_and_select. Memory/loop
+    // functions the verifier can't model as a whole are only accepted when the
+    // pipeline is in best-effort (trust_unverified) mode.
+    mcfg.require_smt_reverify = true;
+    mcfg.trust_unverified_slices = config_.trust_unverified;
+
+    search::PeepholeMiner miner(&eval_engine_, mcfg);
+    bool whole_fn_proven = false;
+    // The straight-line window pass gets a third of the phase budget; the
+    // harvest/select pass below is the higher-yield path on -O3 code and
+    // must not be starved on large functions.
+    if (mcfg.time_budget_seconds > 0.0)
+        miner.config().time_budget_seconds = mcfg.time_budget_seconds / 3.0;
+    auto rewritten = miner.mine_and_rewrite(fn, &whole_fn_proven);
+
+    // ── Souper-style harvesting fallback ────────────────────────────
+    // If the straight-line slice miner (mine_and_rewrite) found no win,
+    // try the more general harvesting path, which lifts every integer
+    // instruction (replacing unsupported operands with opaque vars) and
+    // can find wins on functions with memory ops, calls, and phi nodes.
+    // With use_path_conditions (default), each slice is additionally mined
+    // under the branch conditions dominating its block — the Souper-class
+    // lever that finds wins the mutation search cannot. Both paths are SMT-verified.
+    if ((!rewritten || !*rewritten) && config_.enable_harvest_miner) {
+        // Refresh the budget from the true remaining time for this pass.
+        const double rem2 = remaining_seconds();
+        if (std::isfinite(rem2))
+            miner.config().time_budget_seconds =
+                std::max(0.05, std::min(rem2, 30.0));
+        rewritten = mcfg.use_path_conditions
+                        ? miner.mine_with_path_conditions(fn, &whole_fn_proven)
+                        : miner.harvest_and_rewrite(fn, &whole_fn_proven);
+        if (rewritten && *rewritten && config_.verbose) {
+            std::cerr << "  [harvest] " << fn.name() << ": harvesting found "
+                      << miner.stats().harvest_rewrites_applied << " splice(s) ("
+                      << miner.stats().pc_slices_mined << " under path conditions)\n";
+        }
+    }
+
+    if (!rewritten || !*rewritten) return {};
+
+    search::Candidate cand;
+    cand.function = *rewritten;
+    cand.score = eval_engine_.analyse(**rewritten).score;
+    cand.iteration_found = 0;
+    cand.description = "peephole-miner (SMT-verified slice rewrite)";
+    cand.structural_hash = search::StochasticSearch::structural_hash(**rewritten);
+    // Sound iff the miner's whole-function SMT re-verification proved the
+    // rewrite Equivalent end-to-end. Rewrites accepted through the
+    // trust_unverified_slices escape hatch (memory/loop functions the
+    // verifier can't model as a whole) carry per-slice proofs only, so they
+    // go through verify_and_select's normal Unknown handling and are
+    // reported honestly as unverified.
+    cand.sound = whole_fn_proven;
+
+    if (config_.verbose) {
+        std::cerr << "  [mine] " << fn.name() << ": peephole miner applied "
+                  << miner.stats().rewrites_applied << " slice rewrite(s)\n";
+    }
+
+    std::vector<search::Candidate> out;
+    out.push_back(std::move(cand));
+    return out;
+}
+
+// ── vector_phase (vector-intrinsic synthesis) ───────────────────────────────
+
+std::vector<search::Candidate> Pipeline::vector_phase(const ir::Function& fn,
+                                                       Searchers& s) {
+    if (config_.opt_level < 2) return {};
+    if (!config_.enable_vector_synth) return {};
+    if (remaining_seconds() <= 0.05) return {};
+    // Cheap pre-filter: every synthesised form consumes vector values.
+    if (!ir::function_has_vector_ops(fn)) return {};
+    // Like the miner, the synthesiser is deterministic — run each distinct
+    // baseline at most once.
+    const uint64_t h = search::StochasticSearch::structural_hash(fn);
+    if (h == s.last_vector_hash) return {};
+    s.last_vector_hash = h;
+
+    search::VectorSynthConfig vcfg;
+    if (config_.smt_config.timeout_ms > 0)
+        vcfg.smt_timeout_ms = config_.smt_config.timeout_ms;
+    // Without a prover the pass returns rewrites only in best-effort mode
+    // (they then go through verify_and_select's normal Unknown handling).
+    vcfg.trust_unverified =
+        config_.trust_unverified || config_.skip_smt ||
+        !search::SMTVerifier::is_z3_available();
+
+    search::VectorSynthesizer synth(&eval_engine_, vcfg);
+    bool proven = false;
+    auto rewritten = synth.synthesize(fn, &proven);
+    if (!rewritten) return {};
+
+    search::Candidate cand;
+    cand.function = rewritten;
+    cand.score = eval_engine_.analyse(*rewritten).score;
+    cand.iteration_found = 0;
+    cand.description = proven
+        ? "vector-intrinsic synthesis (SMT-verified)"
+        : "vector-intrinsic synthesis (unverified)";
+    cand.structural_hash = search::StochasticSearch::structural_hash(*rewritten);
+    cand.sound = proven;
+
+    if (config_.verbose) {
+        std::cerr << "  [vector] " << fn.name() << ": synthesised "
+                  << synth.stats().lane_fusions << " vector op(s), "
+                  << synth.stats().reductions << " reduction intrinsic(s), "
+                  << synth.stats().shuffle_folds << " shuffle fold(s)"
+                  << (proven ? " [proven]" : " [unproven]") << "\n";
+    }
+
+    std::vector<search::Candidate> out;
+    out.push_back(std::move(cand));
+    return out;
+}
+
+// ── loop_phase (LICM + constant-trip full unrolling) ────────────────────────
+
+std::vector<search::Candidate> Pipeline::loop_phase(const ir::Function& fn,
+                                                     Searchers& s) {
+    if (config_.opt_level < 2) return {};
+    if (!config_.enable_loop_opt) return {};
+    if (remaining_seconds() <= 0.05) return {};
+    if (!ir::has_back_edge(fn)) return {};  // cheap pre-filter
+
+    const uint64_t h = search::StochasticSearch::structural_hash(fn);
+    if (h == s.last_loop_hash) return {};
+    s.last_loop_hash = h;
+
+    search::LoopOptimizer lopt;
+    std::vector<search::Candidate> out;
+
+    auto push = [&](std::shared_ptr<ir::Function> rewritten,
+                    const char* what) {
+        if (!rewritten) return;
+        search::Candidate cand;
+        cand.function = rewritten;
+        cand.score = eval_engine_.analyse(*rewritten).score;
+        cand.iteration_found = 0;
+        cand.description = what;
+        cand.structural_hash =
+            search::StochasticSearch::structural_hash(*rewritten);
+        // Exact by construction (pure-instruction hoisting with stripped
+        // poison flags / simulation-proved trip counts) — the class of
+        // candidate verify_and_select adopts without a prover, which is
+        // the only option here: the SMT verifier refuses back-edges.
+        cand.sound = true;
+        out.push_back(std::move(cand));
+    };
+
+    auto hoisted = lopt.hoist_invariants(fn);
+    push(hoisted, "loop-invariant code motion (sound)");
+
+    // Unroll from the hoisted version when available — LICM shrinks the
+    // body the unroller must clone.
+    auto unrolled = lopt.unroll_constant_loops(hoisted ? *hoisted : fn);
+    push(unrolled, "constant-trip loop unrolling (sound)");
+
+    if (config_.verbose && !out.empty()) {
+        std::cerr << "  [loop] " << fn.name() << ": hoisted "
+                  << lopt.stats().instructions_hoisted << " instruction(s), unrolled "
+                  << lopt.stats().loops_unrolled << " loop(s) ("
+                  << lopt.stats().iterations_expanded << " iterations)\n";
+    }
+    return out;
+}
+
+// ── mem_phase (alias-aware memory optimisation) ─────────────────────────────
+
+std::vector<search::Candidate> Pipeline::mem_phase(const ir::Function& fn,
+                                                    Searchers& s) {
+    if (config_.opt_level < 2) return {};
+    if (!config_.enable_mem_opt) return {};
+    if (remaining_seconds() <= 0.05) return {};
+
+    const uint64_t h = search::StochasticSearch::structural_hash(fn);
+    if (h == s.last_mem_hash) return {};
+    s.last_mem_hash = h;
+
+    search::MemOptimizer mopt;
+    auto rewritten = mopt.optimize(fn);
+    if (!rewritten) return {};
+
+    search::Candidate cand;
+    cand.function = rewritten;
+    cand.score = eval_engine_.analyse(*rewritten).score;
+    cand.iteration_found = 0;
+    cand.description = "alias-aware memory optimisation (sound)";
+    cand.structural_hash = search::StochasticSearch::structural_hash(*rewritten);
+    cand.sound = true;  // exact under the conservative alias oracle
+
+    if (config_.verbose) {
+        std::cerr << "  [mem] " << fn.name() << ": forwarded "
+                  << mopt.stats().loads_forwarded << " store(s)-to-load, eliminated "
+                  << mopt.stats().loads_eliminated << " redundant load(s), "
+                  << mopt.stats().stores_eliminated << " dead store(s)\n";
+    }
+
+    std::vector<search::Candidate> out;
+    out.push_back(std::move(cand));
+    return out;
+}
+
+// ── dataflow_prune_phase ─────────────────────────────────────────────────
+// DCE + unreachable-block elimination + known-bits-driven constant/branch
+// folding (see clunk/IR/DataflowPrune.h). Sound by construction — same
+// trust tier as loop_phase/mem_phase above.
+
+std::vector<search::Candidate> Pipeline::dataflow_prune_phase(const ir::Function& fn,
+                                                               Searchers& s) {
+    if (config_.opt_level < 2) return {};
+    if (!config_.enable_dataflow_prune) return {};
+    if (remaining_seconds() <= 0.05) return {};
+
+    const uint64_t h = search::StochasticSearch::structural_hash(fn);
+    if (h == s.last_prune_hash) return {};
+    s.last_prune_hash = h;
+
+    ir::PruneStats stats;
+    auto pruned = ir::prune_dataflow(fn, &stats);
+    if (!pruned) return {};
+
+    search::Candidate cand;
+    cand.function = pruned;
+    cand.score = eval_engine_.analyse(*pruned).score;
+    cand.iteration_found = 0;
+    cand.description = "dataflow pruning (DCE + known-bits simplify, sound)";
+    cand.structural_hash = search::StochasticSearch::structural_hash(*pruned);
+    // Every rewrite prune_dataflow performs is exact by construction (dead
+    // code has no observable effect by definition; known-bits folds and
+    // the branch/block pruning they enable are standard sound peephole
+    // transforms) — same trust tier as loop_phase/mem_phase.
+    cand.sound = true;
+
+    if (config_.verbose) {
+        std::cerr << "  [prune] " << fn.name() << ": removed "
+                  << stats.instructions_removed << " dead instruction(s), "
+                  << stats.blocks_removed << " unreachable block(s); folded "
+                  << stats.values_folded_constant << " known-constant value(s), "
+                  << stats.comparisons_folded << " comparison(s), "
+                  << stats.redundant_masks_removed << " redundant mask(s), "
+                  << stats.branches_simplified << " branch(es)\n";
+    }
+
+    std::vector<search::Candidate> out;
+    out.push_back(std::move(cand));
+    return out;
+}
+
+// ── egraph_phase ────────────────────────────────────────────────────────
+
+std::vector<search::Candidate> Pipeline::egraph_phase(const ir::Function& fn,
+                                                        Searchers& s) {
+    if (!config_.enable_egraph_phase) return {};
+    if (config_.opt_level < 2) return {};
+    if (remaining_seconds() <= 0.01) return {};
+    // The e-graph rewriter consumes pattern-library rewrites; if the library
+    // is empty (or only has built-in seed patterns that don't apply), there
+    // is nothing to do.
+    if (pattern_lib_.size() == 0) return {};
+
+    // ── Skip e-graph on unchanged baseline ───────────────────────
+    // The e-graph is deterministic: given the same input function and the
+    // same pattern library, it produces the same output. If the baseline
+    // hasn't changed since the last e-graph run, re-running it would
+    // produce the same candidate that was already rejected (or adopted),
+    // wasting cycles. Skip it.
+    const uint64_t h = search::StochasticSearch::structural_hash(fn);
+    if (h == s.last_egraph_hash) return {};
+    s.last_egraph_hash = h;
+
+    // egraph_rewrite() returns nullopt if the saturated+extracted function
+    // is not strictly cheaper than the input.
+    auto opt = search::egraph_rewrite(fn, pattern_lib_,
+                                       config_.target_arch, eval_engine_);
+    if (!opt) return {};
+
+    // ── E-graph candidates are sound-by-construction ──────────────
+    // The e-graph only applies pattern-library rewrites. All pattern-library
+    // patterns are sound: the built-in seed patterns (add_zero_elim,
+    // mul_one_elim, double_negation, strength_reduce_mul, constant_fold,
+    // dead_code_elim) are algebraic identities / compile-time folds, and
+    // miner-discovered patterns are SMT-proven. The e-graph's merge
+    // operation preserves soundness transitively: if A≡B and B≡C are both
+    // sound, then A≡C is sound. So the extracted cheapest representative
+    // is sound-by-construction.
+    //
+    // This is CRUCIAL for real-world code: without it, e-graph wins on
+    // functions with memory ops or loops (where SMT bails to Unknown) are
+    // never adopted — the candidate goes through SMT, gets Unknown, and is
+    // rejected. Marking it sound=true lets verify_and_select adopt it
+    // without SMT, which is the only way the e-graph can help on code
+    // (where most functions have memory ops).
+    opt->sound = true;
+
+    if (config_.verbose) {
+        std::cerr << "  [egraph] " << fn.name()
+                  << ": equality-saturation produced a candidate (score="
+                  << opt->score << ")\n";
+    }
+
+    std::vector<search::Candidate> out;
+    out.push_back(std::move(*opt));
+    return out;
+}
+
+// ── verify_and_select ───────────────────────────────────────────────────────
+
+std::shared_ptr<ir::Function> Pipeline::verify_and_select(
+    const ir::Function& original,
+    const ir::Function& current,
+    const std::vector<search::Candidate>& candidates,
+    PipelineResult::FunctionResult& result,
+    Searchers& s)
+{
+    if (candidates.empty()) return nullptr;
+
+    // Score the current baseline — a candidate must beat THIS to be worth
+    // adopting (the baseline itself already beats the original).
+    double baseline_score = eval_engine_.analyse(current).score;
+
+    // Evaluate each candidate
+    struct ScoredCandidate {
+        const search::Candidate* candidate;
+        double score;
+    };
+
+    std::vector<ScoredCandidate> scored;
+    scored.reserve(candidates.size());
+    for (auto& cand : candidates) {
+        if (!cand.function) continue;
+        double cand_score = eval_engine_.analyse(*cand.function).score;
+        // Only consider candidates strictly better than the baseline
+        // (less negative = better)
+        if (cand_score > baseline_score) {
+            // ── Skip candidates already SMT-rejected this round-chain ──
+            // The candidate's structural hash uniquely identifies it (up to
+            // SSA renaming). If we already tried and rejected this exact
+            // candidate in a previous round (when the baseline was the same),
+            // don't waste another SMT call on it.
+            uint64_t chash = cand.structural_hash;
+            if (chash == 0) {
+                chash = search::StochasticSearch::structural_hash(*cand.function);
+            }
+            if (s.rejected_hashes.count(chash)) {
+                if (config_.verbose) {
+                    std::cerr << "  [verify] " << original.name()
+                              << ": skipping already-rejected candidate (hash="
+                              << chash << ")\n";
+                }
+                continue;
+            }
+            scored.push_back({&cand, cand_score});
+        }
+    }
+
+    if (scored.empty()) return nullptr;
+
+    // Sort by score (higher = better, since scores are negative)
+    std::sort(scored.begin(), scored.end(),
+              [](const ScoredCandidate& a, const ScoredCandidate& b) {
+                  return a.score > b.score;
+              });
+
+    // ── llvm-mca final ranking (opt-in, Minotaur-style) ────────────────
+    // Re-rank the top candidates by MEASURED cycles against the current
+    // baseline: candidates the machine model can measure and says are
+    // NOT faster are dropped; measured candidates order by their cycle
+    // ratio (best first) ahead of unmeasurable ones (which keep the
+    // built-in cost-model order as the fallback signal). Bounded to the
+    // top 8 — each measurement is two subprocess launches (cached).
+    if (config_.use_mca_ranker && evaluator::MCACostModel::is_available()) {
+        struct MCAScored {
+            ScoredCandidate sc;
+            double ratio;  // >1 = faster than baseline; 0 = unmeasurable
+        };
+        std::vector<MCAScored> kept;
+        kept.reserve(scored.size());
+        size_t measured_budget = 8;
+        for (auto& sc : scored) {
+            double ratio = 0.0;
+            if (measured_budget > 0) {
+                --measured_budget;
+                ratio = mca_.compare(current, *sc.candidate->function);
+            }
+            if (ratio > 0.0 && ratio <= 1.0) {
+                if (config_.verbose) {
+                    std::cerr << "  [mca] " << original.name()
+                              << ": dropped a candidate llvm-mca measures at "
+                              << ratio << "x baseline\n";
+                }
+                continue;  // measured, not actually faster
+            }
+            kept.push_back({sc, ratio});
+        }
+        std::stable_sort(kept.begin(), kept.end(),
+                         [](const MCAScored& a, const MCAScored& b) {
+                             return a.ratio > b.ratio;
+                         });
+        scored.clear();
+        for (auto& k : kept) scored.push_back(k.sc);
+        if (scored.empty()) return nullptr;
+    }
+
+    // Adopt in order of score. Three tiers of trust:
+    //   1. sound-by-construction candidates (derived from the baseline
+    //      purely via semantics-preserving rewrites — DCE, CSE, folding,
+    //      identities, strength reduction, guarded swaps) need no prover
+    //      at all. This is what lets clunk optimise real clang IR, where
+    //      memory ops and loops put SMT permanently out of reach.
+    //   2. SMT-verified candidates — always proved against the ORIGINAL
+    //      function, never against `current`, so every adopted baseline
+    //      in the refinement chain is independently anchored.
+    //   3. (opt-in) candidates the prover returned Unknown for.
+    // Candidates PROVED NotEquivalent are never adopted, in any mode.
+    bool z3_available = !config_.skip_smt &&
+                        search::SMTVerifier::is_z3_available();
+
+    if (!z3_available) {
+        // No prover available (or explicitly skipped): trust the evaluator.
+        result.verified = scored[0].candidate->sound;
+        return scored[0].candidate->function;
+    }
+
+    std::shared_ptr<ir::Function> unknown_fallback;
+    size_t smt_attempts = 0;
+    constexpr size_t MAX_SMT_ATTEMPTS = 5;
+    for (auto& sc : scored) {
+        if (sc.candidate->sound) {
+            result.verified = true;
+            return sc.candidate->function;
+        }
+        if (smt_attempts >= MAX_SMT_ATTEMPTS) continue;
+        ++smt_attempts;
+        auto vr = s.smt.verify(original, *sc.candidate->function);
+        if (vr.is_safe()) {
+            result.verified = true;
+            return sc.candidate->function;
+        }
+        // ── Record the rejection so we don't re-try this candidate ──
+        uint64_t chash = sc.candidate->structural_hash;
+        if (chash == 0) {
+            chash = search::StochasticSearch::structural_hash(*sc.candidate->function);
+        }
+        s.rejected_hashes.insert(chash);
+
+        if (vr.status == search::VerificationResult::NotEquivalent) {
+            continue;
+        }
+        // Unknown / Error: eligible for best-effort adoption below.
+        if (config_.trust_unverified && !unknown_fallback) {
+            unknown_fallback = sc.candidate->function;
+        }
+    }
+    if (unknown_fallback) {
+        result.verified = false;
+        return unknown_fallback;
+    }
+    // Souper-style soundness (default): improving candidates existed but
+    // none carried a proof — keep the current baseline.
+    if (config_.verbose) {
+        std::cerr << "  [verify] " << original.name() << ": " << scored.size()
+                  << " improving candidate(s), none provable — rerun with "
+                     "--trust-unverified to adopt best-effort\n";
+    }
+    return nullptr;
+}
+
+#ifdef CLUNK_HAS_GPU
+// ── gpu_optimise ────────────────────────────────────────────────────────────
+
+std::shared_ptr<ir::Function> Pipeline::gpu_optimise(const ir::Function& fn) {
+    gpu::PTXOptimizer ptx_opt(config_.target_arch);
+
+    // Run PTX-level optimisation
+    auto optimised = ptx_opt.optimise(fn);
+
+    if (optimised && config_.enable_launch_opt) {
+        // Tune kernel launch configuration
+        gpu::KernelLaunchOptimizer launch_opt(config_.target_arch);
+        gpu::LaunchConfig default_config;
+        auto launch_result = launch_opt.optimise_launch(*optimised, default_config);
+
+        // Store the launch config as function attributes
+        optimised->set_attribute("gpu.block_x",
+                                 std::to_string(launch_result.optimised.block_x));
+        optimised->set_attribute("gpu.block_y",
+                                 std::to_string(launch_result.optimised.block_y));
+        optimised->set_attribute("gpu.block_z",
+                                 std::to_string(launch_result.optimised.block_z));
+        optimised->set_attribute("gpu.estimated_speedup",
+                                 std::to_string(launch_result.estimated_speedup));
+        optimised->set_attribute("gpu.launch_rationale",
+                                 launch_result.rationale);
+    }
+
+    return optimised;
+}
+#endif
+
+// ── report_progress ─────────────────────────────────────────────────────────
+
+void Pipeline::report_progress(const std::string& stage,
+                                const std::string& fn_name,
+                                double progress) {
+    if (progress_cb_) {
+        // Serialised: workers report progress concurrently in the parallel
+        // module path, and the user's callback need not be thread-safe.
+        std::lock_guard<std::mutex> lock(progress_mutex_);
+        progress_cb_(stage, fn_name, progress);
+    }
+}
+
+} // namespace clunk

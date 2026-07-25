@@ -1,0 +1,48 @@
+@PACKAGE_INIT@
+
+include("${CMAKE_CURRENT_LIST_DIR}/ClunkOpt.cmake")
+
+# Use PACKAGE_PREFIX_DIR (computed by CMake from the installed config location)
+set_and_check(Clunk_INCLUDE_DIR "${PACKAGE_PREFIX_DIR}/include")
+set_and_check(Clunk_LIB_DIR "${PACKAGE_PREFIX_DIR}/lib")
+
+find_library(Clunk_LIBRARY NAMES clunk_core PATHS "${Clunk_LIB_DIR}" NO_DEFAULT_PATH)
+
+if(NOT Clunk_LIBRARY)
+    find_library(Clunk_LIBRARY NAMES clunk_core)
+endif()
+
+# Z3 is no longer a link-time dependency — it is loaded at runtime via dlopen.
+# Consumers of this package do not need libz3 at link time.
+find_library(Clunk_DL_LIBRARY NAMES dl)
+
+if(Clunk_LIBRARY)
+    set(Clunk_FOUND TRUE)
+endif()
+
+include(FindPackageHandleStandardArgs)
+find_package_handle_standard_args(Clunk
+    REQUIRED_VARS Clunk_LIBRARY Clunk_INCLUDE_DIR
+)
+
+if(Clunk_FOUND AND NOT TARGET Clunk::clunk_core)
+    add_library(Clunk::clunk_core STATIC IMPORTED)
+    set_target_properties(Clunk::clunk_core PROPERTIES
+        IMPORTED_LOCATION "${Clunk_LIBRARY}"
+        INTERFACE_INCLUDE_DIRECTORIES "${Clunk_INCLUDE_DIR}"
+    )
+
+    # Link transitive dependencies (only dl — Z3 is runtime-only)
+    set(_clunk_deps "")
+    if(Clunk_DL_LIBRARY)
+        list(APPEND _clunk_deps "${Clunk_DL_LIBRARY}")
+    endif()
+    if(_clunk_deps)
+        set_target_properties(Clunk::clunk_core PROPERTIES
+            INTERFACE_LINK_LIBRARIES "${_clunk_deps}"
+        )
+    endif()
+
+    # Indicate that Z3 may be available at runtime (not a link-time concern)
+    set(Clunk_Z3_RUNTIME TRUE)
+endif()
