@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 #include <unordered_set>
+#include <unordered_map>
 #include <functional>
 #include "clunk/IR/Module.h"
 #include "clunk/IR/Function.h"
@@ -38,6 +39,7 @@
 #include "clunk/Search/EgraphRewriter.h"
 #include "clunk/Search/RewriteCache.h"
 #include "clunk/Pattern/PatternLibrary.h"
+#include "clunk/IR/StrengthReduce.h"
 
 namespace clunk {
 
@@ -150,23 +152,35 @@ struct PipelineConfig {
     // construction. Default ON.
     bool enable_mem_opt = true;
 
-    // ── Dataflow pruning (dead-code + unreachable-block elimination +
-    //     known-bits-driven constant/branch folding) ─────────────────────
+    // ── Dataflow pruning (dead-code + same-block CSE + unreachable-block
+    //     elimination + known-bits-driven constant/branch folding) ───────
     // Runs ir::prune_dataflow() on the current baseline every round,
     // before the mutation searches see it: dead-code elimination (def-use
-    // closure — no CFG traversal needed, correct across loops), removal
-    // of blocks unreachable from entry (with Phi fixup), and a lightweight
-    // Souper-style "infer known bits" pass (see clunk/Analysis/
-    // KnownBits.h) that folds provably-constant values, drops no-op AND
-    // masks, resolves provably-true/false comparisons, and turns a
-    // conditional Br with a now-constant condition into an unconditional
-    // one (which is what feeds the unreachable-block pass its work).
-    // Sound by construction — same trust tier as LoopOpt/MemOpt. This
-    // doesn't just shrink the FINAL output: a smaller, cleaner baseline is
-    // cheaper for every later phase this round and every round after
-    // (fewer instructions to mutate, lower to the e-graph, or measure).
-    // Default ON.
+    // closure — no CFG traversal needed, correct across loops), same-block
+    // common-subexpression elimination (every duplicate pure computation
+    // in a block is deduplicated, exhaustively — see clunk/IR/
+    // DataflowPrune.h's simplify_cse), removal of blocks unreachable from
+    // entry (with Phi fixup), and a lightweight Souper-style "infer known
+    // bits" pass (see clunk/Analysis/KnownBits.h) that folds
+    // provably-constant values, drops no-op AND masks, resolves
+    // provably-true/false comparisons, and turns a conditional Br with a
+    // now-constant condition into an unconditional one (which is what
+    // feeds the unreachable-block pass its work). Sound by construction —
+    // same trust tier as LoopOpt/MemOpt. This doesn't just shrink the
+    // FINAL output: a smaller, cleaner baseline is cheaper for every later
+    // phase this round and every round after (fewer instructions to
+    // mutate, lower to the e-graph, or measure). Default ON.
     bool enable_dataflow_prune = true;
+
+    // ── Powers-of-two strength reduction ─────────────────────────────────
+    // Runs ir::simplify_pow2_strength_reduce() on the current baseline
+    // every round: rewrites `x urem y` to `x and (y - 1)` whenever the
+    // PowersOfTwo analysis (clunk/Analysis/PowersOfTwo.h, itself layered
+    // on KnownBits) proves y is a nonzero power of two — including when y
+    // is a RUNTIME value, not just a compile-time constant (constant
+    // divisors are already folded elsewhere). Sound by construction —
+    // same trust tier as LoopOpt/MemOpt/dataflow pruning. Default ON.
+    bool enable_pow2_strength_reduce = true;
 
     // ── Interprocedural inlining ─────────────────────────────────────────
     // Inline small single-block module-internal callees before optimising
@@ -230,6 +244,25 @@ struct PipelineConfig {
     bool verbose = false;
     bool dump_candidates = false;
     std::string dump_dir;
+
+    // ── Verbose output throttling ────────────────────────────────────────
+    // The per-round diagnostic lines emitted when verbose is on (one per
+    // phase that fired: "[mem] ...", "[prune] ...", "[round N] adopted",
+    // etc.) are genuinely useful for a short debugging run, but for
+    // long-running superoptimisation (thousands of rounds) printing every
+    // single one floods the console with near-duplicate lines and the
+    // signal that matters — is this STILL making progress? — gets buried.
+    // Each diagnostic site is independently rate-limited (per stage, per
+    // function) to at most one line every verbose_interval_seconds; the
+    // very first line for a given (stage, function) always prints
+    // immediately, and the aggregate counts are always available at the
+    // end from the per-function summary regardless of how much was
+    // throttled along the way. 0 disables throttling entirely (every line
+    // prints, i.e. the old unthrottled firehose behaviour) — useful when
+    // debugging a specific short-lived issue where every line matters.
+    // Default: 1 line/second/stage, which is plenty to see live progress
+    // without scrolling thousands of lines on a long run.
+    double verbose_interval_seconds = 1.0;
 
     // ── Scale-control fields ──────────────────────────────────────────
     // Maximum function size (instruction count) to attempt superoptimisation.
@@ -327,6 +360,7 @@ private:
         uint64_t last_loop_hash = 0;    // loop-opt guard, reset per fn
         uint64_t last_mem_hash = 0;     // mem-opt guard, reset per fn
         uint64_t last_prune_hash = 0;   // dataflow-prune guard, reset per fn
+        uint64_t last_pow2_hash = 0;    // pow2 strength-reduce guard, reset per fn
         // Rejected-candidate cache: structural hashes of candidates
         // that were SMT-rejected this round-chain. Prevents re-proposing
         // and re-rejecting the same candidate on unchanged baselines.
@@ -401,6 +435,14 @@ private:
     std::vector<search::Candidate> dataflow_prune_phase(const ir::Function& fn,
                                                          Searchers& s);
 
+    // ── Powers-of-two strength-reduction phase ───────────────────────────
+    // ir::simplify_pow2_strength_reduce(): `x urem y` -> `x and (y - 1)`
+    // wherever the PowersOfTwo analysis proves y is a nonzero power of
+    // two, including at runtime. Exact by construction. Guarded by
+    // last_pow2_hash.
+    std::vector<search::Candidate> pow2_phase(const ir::Function& fn,
+                                               Searchers& s);
+
     // Select the best candidate that beats `current`, verifying against
     // `original` (the soundness anchor for the whole refinement chain).
     // Sets result.verified when the selection was SMT-proved.
@@ -423,6 +465,18 @@ private:
                           const std::string& fn_name,
                           double progress);
 
+    // ── Verbose-output throttling ─────────────────────────────────────
+    // Gate for every per-round `if (config_.verbose) { std::cerr << ... }`
+    // diagnostic site: returns true at most once every
+    // config_.verbose_interval_seconds for a given (stage, fn_name) pair
+    // (always true the first time a pair is seen, and always true when
+    // verbose_interval_seconds <= 0, i.e. throttling disabled). See
+    // PipelineConfig::verbose_interval_seconds for the rationale. Callers
+    // still gate on config_.verbose themselves first — this only decides
+    // WHETHER a verbose-eligible line prints this time, not whether
+    // verbose mode is on at all.
+    bool should_log_verbose(const std::string& stage, const std::string& fn_name);
+
     PipelineConfig config_;
     evaluator::EvaluationEngine eval_engine_;
     // llvm-mca final ranker (opt-in, see PipelineConfig::use_mca_ranker).
@@ -433,6 +487,13 @@ private:
     pattern::PatternLibrary pattern_lib_;
     ProgressCallback progress_cb_;
     std::mutex progress_mutex_;        // guards progress_cb_ across workers
+
+    // Last-emitted timestamp per "stage|fn_name" key, for
+    // should_log_verbose() above. Guarded by verbose_mutex_ since worker
+    // threads superoptimise different functions concurrently and must
+    // not throttle each other's independent (stage, fn_name) lines.
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> last_verbose_emit_;
+    std::mutex verbose_mutex_;
 
     // ── Persistent SMT rewrite cache ──────────────────────────────────
     // Shared across all worker threads. Created lazily in the constructor

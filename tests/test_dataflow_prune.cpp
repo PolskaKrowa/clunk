@@ -363,6 +363,132 @@ exit:
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════
+//  simplify_cse
+// ═══════════════════════════════════════════════════════════════════════
+
+static void test_cse_deduplicates_identical_add() {
+    auto mod = parse(R"(
+define i32 @f(i32 %a, i32 %b) {
+entry:
+  %x = add i32 %a, %b
+  %y = add i32 %a, %b
+  %z = mul i32 %x, %y
+  ret i32 %z
+}
+)");
+    auto fn = mod->function("f");
+    CHECK(fn != nullptr, "parses");
+    if (!fn) return;
+
+    PruneStats stats;
+    auto out = simplify_cse(*fn, &stats);
+    CHECK(out != nullptr, "CSE fires on an exact same-block duplicate");
+    if (!out) return;
+    CHECK(stats.subexpressions_eliminated == 1, "exactly one duplicate eliminated");
+    CHECK(count_opcode(*out, Opcode::Add) == 1, "only one add survives");
+
+    for (int64_t a : {0, 1, -3, 100}) {
+        for (int64_t b : {0, -1, 7, 50}) {
+            auto r0 = evaluator::Interpreter::interpret(*fn, {a, b});
+            auto r1 = evaluator::Interpreter::interpret(*out, {a, b});
+            CHECK(r0 && r1 && *r0 == *r1, "CSE preserves semantics");
+        }
+    }
+}
+
+static void test_cse_is_block_local_only() {
+    // The exact same computation appears in two DIFFERENT blocks. CSE in
+    // this codebase is deliberately block-local (see header comment —
+    // no dominator tree available, and same-block scope needs none), so
+    // this must NOT be merged across blocks.
+    auto mod = parse(R"(
+define i32 @f(i32 %a, i32 %b, i1 %c) {
+entry:
+  br i1 %c, label %t, label %e
+
+t:
+  %x = add i32 %a, %b
+  ret i32 %x
+
+e:
+  %y = add i32 %a, %b
+  ret i32 %y
+}
+)");
+    auto fn = mod->function("f");
+    CHECK(fn != nullptr, "parses");
+    if (!fn) return;
+    auto out = simplify_cse(*fn);
+    CHECK(out == nullptr, "no cross-block CSE: each add stays in its own block");
+}
+
+static void test_cse_leaves_loads_alone() {
+    // Loads are excluded from CSE (they need alias analysis — that's
+    // MemOpt's job, see clunk/Search/MemOpt.h's redundant-load
+    // elimination). Two textually-identical loads must be left as-is by
+    // THIS pass even with no intervening store.
+    auto mod = parse(R"(
+define i32 @f(ptr %p) {
+entry:
+  %x = load i32, ptr %p
+  %y = load i32, ptr %p
+  %z = add i32 %x, %y
+  ret i32 %z
+}
+)");
+    auto fn = mod->function("f");
+    CHECK(fn != nullptr, "parses");
+    if (!fn) return;
+    auto out = simplify_cse(*fn);
+    CHECK(out == nullptr, "simplify_cse never touches loads (out of its scope)");
+}
+
+static void test_cse_respects_differing_predicates() {
+    // Same opcode/operands but a different comparison predicate must NOT
+    // be treated as a duplicate.
+    auto mod = parse(R"(
+define i32 @f(i32 %a, i32 %b) {
+entry:
+  %lt = icmp slt i32 %a, %b
+  %gt = icmp sgt i32 %a, %b
+  %lt2 = zext i1 %lt to i32
+  %gt2 = zext i1 %gt to i32
+  %r = add i32 %lt2, %gt2
+  ret i32 %r
+}
+)");
+    auto fn = mod->function("f");
+    CHECK(fn != nullptr, "parses");
+    if (!fn) return;
+    auto out = simplify_cse(*fn);
+    CHECK(out == nullptr, "icmp slt and icmp sgt are not duplicates of each other");
+}
+
+static void test_cse_chains_through_dce_in_prune_dataflow() {
+    // Once the duplicate is dropped by CSE, it becomes genuinely dead
+    // (nothing else in the original references it either) — confirms
+    // simplify_cse and eliminate_dead_code compose correctly through the
+    // combined prune_dataflow() driver.
+    auto mod = parse(R"(
+define i32 @f(i32 %a, i32 %b) {
+entry:
+  %x = add i32 %a, %b
+  %y = add i32 %a, %b
+  ret i32 %x
+}
+)");
+    auto fn = mod->function("f");
+    CHECK(fn != nullptr, "parses");
+    if (!fn) return;
+    PruneStats stats;
+    auto out = prune_dataflow(*fn, &stats);
+    CHECK(out != nullptr, "prune_dataflow fires");
+    if (!out) return;
+    CHECK(instruction_count(*out) == 2, "one add + the ret; the duplicate is gone entirely");
+    CHECK(stats.subexpressions_eliminated == 1, "prune_dataflow reports the CSE stat too");
+}
+
 int main() {
     test_dce_removes_unused_computation();
     test_dce_keeps_side_effects();
@@ -374,6 +500,12 @@ int main() {
 
     test_simplify_folds_constant_mask();
     test_simplify_folds_branch_condition();
+
+    test_cse_deduplicates_identical_add();
+    test_cse_is_block_local_only();
+    test_cse_leaves_loads_alone();
+    test_cse_respects_differing_predicates();
+    test_cse_chains_through_dce_in_prune_dataflow();
 
     test_prune_dataflow_chains_all_three();
     test_prune_dataflow_noop_returns_null();

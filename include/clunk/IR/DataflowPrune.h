@@ -52,9 +52,20 @@
  *     ICmp results that are provably true/false, and turn a conditional
  *     Br with a provably-constant condition into an unconditional one —
  *     which is what feeds remove_unreachable_blocks its work.
- *   - prune_dataflow: runs all three to a (small, bounded) fixed point —
- *     folding can expose more dead code / more unreachable blocks, so a
- *     single pass often leaves easy wins on the table.
+ *   - simplify_cse: same-block common-subexpression elimination — two
+ *     structurally identical pure instructions in one block always
+ *     compute the same value, so every duplicate after the first is
+ *     rewired to reuse the earlier result and dropped. Block-local only
+ *     (same scope restriction as MemOpt's forwarding passes — this
+ *     codebase has no dominator tree, and same-block scope needs none:
+ *     everything earlier in a block always executes before everything
+ *     later in the SAME block). This is the deterministic, exhaustive
+ *     counterpart to StochasticSearch's opportunistic
+ *     EliminateCommonSubexpr mutation, which only fires when the random
+ *     search happens to propose that exact duplicate pair.
+ *   - prune_dataflow: runs all four to a (small, bounded) fixed point —
+ *     folding/deduplication can expose more dead code / more unreachable
+ *     blocks, so a single pass often leaves easy wins on the table.
  */
 #include <memory>
 
@@ -69,10 +80,12 @@ struct PruneStats {
     size_t redundant_masks_removed = 0;
     size_t comparisons_folded = 0;
     size_t branches_simplified = 0;
+    size_t subexpressions_eliminated = 0;
 
     bool changed() const {
         return instructions_removed || blocks_removed || values_folded_constant ||
-               redundant_masks_removed || comparisons_folded || branches_simplified;
+               redundant_masks_removed || comparisons_folded || branches_simplified ||
+               subexpressions_eliminated;
     }
 };
 
@@ -93,9 +106,19 @@ std::shared_ptr<Function> remove_unreachable_blocks(const Function& fn,
 // an unconditional one. Returns nullptr if nothing was simplified.
 std::shared_ptr<Function> simplify_known_bits(const Function& fn, PruneStats* stats = nullptr);
 
-// Runs simplify_known_bits → remove_unreachable_blocks → eliminate_dead_code
-// repeatedly (bounded iterations) until nothing changes. This is the
-// entry point Pipeline uses. Returns nullptr if nothing changed at all.
+// Same-block common-subexpression elimination: every instruction after
+// the first in a block that is a structural duplicate (same opcode,
+// flags, predicate, type, and operands — by resolved identity for named
+// values, by value for constants) of an earlier instruction in the SAME
+// block is replaced by that earlier result. Restricted to pure,
+// deterministic, non-memory opcodes (no loads — those need alias
+// analysis, see MemOpt). Returns nullptr if nothing was eliminated.
+std::shared_ptr<Function> simplify_cse(const Function& fn, PruneStats* stats = nullptr);
+
+// Runs simplify_known_bits → simplify_cse → remove_unreachable_blocks →
+// eliminate_dead_code repeatedly (bounded iterations) until nothing
+// changes. This is the entry point Pipeline uses. Returns nullptr if
+// nothing changed at all.
 std::shared_ptr<Function> prune_dataflow(const Function& fn, PruneStats* stats = nullptr);
 
 } // namespace clunk::ir

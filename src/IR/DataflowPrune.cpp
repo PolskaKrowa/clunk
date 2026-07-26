@@ -90,6 +90,68 @@ void remap_operands_by_name(Function& fn) {
     }
 }
 
+// Structural key for common-subexpression elimination: identical
+// opcode/flags/predicate/type/operands means "same computation". Mirrors
+// StochasticSearch.cpp's cse_key used by the opportunistic
+// EliminateCommonSubexpr mutation (kept as an independent copy — same
+// convention already used across this codebase's several DCE-adjacent
+// passes, e.g. MemOpt's dead-store elimination has its own rule too).
+// `binding` resolves operands through any fold already applied earlier
+// in THIS pass, so a duplicate that only became visible after an earlier
+// instruction was itself deduplicated/folded is still caught.
+std::string cse_key(const Instruction& inst,
+                     const std::unordered_map<std::string, std::shared_ptr<Value>>& binding) {
+    switch (inst.opcode()) {
+        case Opcode::Add: case Opcode::Sub: case Opcode::Mul:
+        case Opcode::UDiv: case Opcode::SDiv:
+        case Opcode::URem: case Opcode::SRem:
+        case Opcode::And: case Opcode::Or: case Opcode::Xor:
+        case Opcode::Shl: case Opcode::LShr: case Opcode::AShr:
+        case Opcode::ICmp: case Opcode::Select:
+        case Opcode::Trunc: case Opcode::ZExt: case Opcode::SExt:
+        case Opcode::PtrToInt: case Opcode::IntToPtr:
+        case Opcode::BitCast:
+        case Opcode::GetElementPtr:
+            break;  // eligible: pure, deterministic, no memory access
+        default:
+            return {};  // loads/stores/calls/phis/FP (NaN quirks)/etc.
+    }
+    if (!inst.has_name()) return {};  // result must be nameable to reuse
+
+    std::string key;
+    key.reserve(64);
+    key += std::to_string(static_cast<unsigned>(inst.opcode()));
+    key += '|';
+    key += inst.binop_flags().to_string();
+    key += '|';
+    auto& md = inst.metadata();
+    auto pred_it = md.find("pred");
+    if (pred_it != md.end()) key += pred_it->second;
+    key += '|';
+    if (inst.type()) key += inst.type()->to_string();
+    for (auto& raw_op : inst.operands()) {
+        key += '|';
+        auto op = raw_op;
+        if (op && op->has_name()) {
+            auto it = binding.find(op->name());
+            if (it != binding.end()) op = it->second;
+        }
+        if (!op) { key += "<null>"; continue; }
+        if (auto ci = std::dynamic_pointer_cast<ConstantInt>(op)) {
+            key += '#';
+            key += std::to_string(ci->value());
+            key += ':';
+            key += std::to_string(ci->bit_width());
+        } else if (op->has_name()) {
+            key += '%';
+            key += op->name();
+        } else {
+            return {};  // unnamed non-constant operand — not comparable
+        }
+    }
+    return key;
+}
+
 } // namespace
 
 // ── eliminate_dead_code ─────────────────────────────────────────────────
@@ -375,6 +437,93 @@ std::shared_ptr<Function> simplify_known_bits(const Function& fn, PruneStats* st
     return work;
 }
 
+// ── simplify_cse ─────────────────────────────────────────────────────────
+
+std::shared_ptr<Function> simplify_cse(const Function& fn, PruneStats* stats) {
+    // Quick pre-check over the ORIGINAL function: is there even one
+    // same-block duplicate pair? Cheap scan, avoids paying for a deep
+    // copy + rebuild when there's nothing to do. This ignores duplicates
+    // that would only appear after operand resolution mid-pass — fine,
+    // it only needs to be a sound may-fire filter; the real pass below
+    // (which does resolve operands) is exact.
+    {
+        bool any = false;
+        const std::unordered_map<std::string, std::shared_ptr<Value>> empty_binding;
+        for (auto& block : fn.blocks()) {
+            if (!block) continue;
+            std::unordered_set<std::string> seen;
+            for (auto& inst : block->instructions()) {
+                if (!inst) continue;
+                std::string k = cse_key(*inst, empty_binding);
+                if (!k.empty() && !seen.insert(k).second) { any = true; break; }
+            }
+            if (any) break;
+        }
+        if (!any) return nullptr;
+    }
+
+    auto work = std::make_shared<Function>(fn.name(), fn.function_type(), fn.linkage());
+    for (auto& arg : fn.arguments()) work->add_argument(arg.type, arg.name, arg.attrs);
+    for (auto& [k, v] : fn.attributes()) work->set_attribute(k, v);
+
+    size_t eliminated = 0;
+
+    // binding: name -> replacement Value, for instructions dropped as
+    // duplicates (resolved through by later operand lookups, same idea
+    // as simplify_known_bits' `binding`/`resolve`).
+    std::unordered_map<std::string, std::shared_ptr<Value>> binding;
+    auto resolve = [&](const std::shared_ptr<Value>& v) -> std::shared_ptr<Value> {
+        if (v && v->has_name()) {
+            auto it = binding.find(v->name());
+            if (it != binding.end()) return it->second;
+        }
+        return v;
+    };
+
+    for (auto& block : fn.blocks()) {
+        if (!block) continue;
+        auto& new_bb = work->add_block(block->name());
+        new_bb.clear_predecessors();
+
+        // Per-block table: structural key -> earlier canonical value.
+        // Reset for every block — same-block scope only (see header).
+        std::unordered_map<std::string, std::shared_ptr<Value>> table;
+
+        for (auto& inst : block->instructions()) {
+            if (!inst) continue;
+
+            std::string key = cse_key(*inst, binding);
+            if (!key.empty()) {
+                auto it = table.find(key);
+                if (it != table.end()) {
+                    // Exact duplicate of an earlier instruction in this
+                    // block: reuse its result instead of recomputing.
+                    binding[inst->name()] = it->second;
+                    ++eliminated;
+                    continue;  // don't emit the duplicate at all
+                }
+            }
+
+            // Rebuild verbatim with resolved operands.
+            auto new_inst = std::make_shared<Instruction>(inst->opcode(), inst->type(), inst->name());
+            for (auto& op : inst->operands()) new_inst->add_operand(resolve(op));
+            for (auto& [k, v] : inst->metadata()) new_inst->set_metadata(k, v);
+            new_inst->binop_flags() = inst->binop_flags();
+            if (inst->alignment()) new_inst->set_alignment(inst->alignment().value());
+            new_inst->set_volatile(inst->is_volatile());
+            new_bb.add_instruction(new_inst);
+
+            if (!key.empty()) table[key] = new_inst;
+        }
+    }
+
+    if (eliminated == 0) return nullptr;
+    remap_operands_by_name(*work);
+    work->compute_predecessors();
+    if (stats) stats->subexpressions_eliminated += eliminated;
+    return work;
+}
+
 // ── prune_dataflow ──────────────────────────────────────────────────────
 
 std::shared_ptr<Function> prune_dataflow(const Function& fn, PruneStats* stats) {
@@ -388,6 +537,11 @@ std::shared_ptr<Function> prune_dataflow(const Function& fn, PruneStats* stats) 
 
         if (auto simplified = simplify_known_bits(*base, &local)) {
             current = simplified;
+            base = current.get();
+            changed_this_iter = true;
+        }
+        if (auto deduped = simplify_cse(*base, &local)) {
+            current = deduped;
             base = current.get();
             changed_this_iter = true;
         }

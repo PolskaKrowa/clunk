@@ -25,6 +25,8 @@ set(TEST_SOURCES
     test_mca
     test_known_bits
     test_dataflow_prune
+    test_powers_of_two
+    test_strength_reduce
 )
 
 if(CLUNK_ENABLE_GPU)

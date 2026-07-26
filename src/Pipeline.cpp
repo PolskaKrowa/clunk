@@ -135,43 +135,9 @@ PipelineResult Pipeline::run(const ir::Module& module) {
 
     // Create the optimised module (deep copy)
     result.optimised_module = std::make_shared<ir::Module>(module.name());
-
-    // ── Round-trip preservation: copy every field the parser captured ──
-    //
-    // The pipeline creates a FRESH Module and copies functions/globals into
-    // it.  Without the copies below, every piece of metadata that clang
-    // needs to recompile the IR (source_filename, module flags, attribute
-    // groups, named metadata, numbered metadata defs, module asm) would be
-    // silently dropped, producing output that fails clang recompilation
-    // with errors like "attribute group #0 not found" or wrong PIC mode.
-    //
-    // Named types are also copied so that user-defined struct types
-    // (%struct.foo) round-trip even when no function in the module uses
-    // them directly (rare, but happens with debug info).
+    // Copy target info
     if (module.has_target()) {
         result.optimised_module->set_target(module.target());
-    }
-    if (!module.source_filename().empty()) {
-        result.optimised_module->set_source_filename(module.source_filename());
-    }
-    for (const auto& mf : module.module_flags()) {
-        result.optimised_module->add_module_flag(mf);
-    }
-    for (const auto& [id, body] : module.attribute_groups()) {
-        result.optimised_module->add_attribute_group(id, body);
-    }
-    for (const auto& [name, body] : module.named_metadata()) {
-        result.optimised_module->add_named_metadata(name, body);
-    }
-    for (const auto& [id, body] : module.metadata_defs()) {
-        result.optimised_module->add_metadata_def(id, body);
-    }
-    for (const auto& asm_line : module.module_asm()) {
-        result.optimised_module->add_module_asm(asm_line);
-    }
-    // Named types — copy verbatim so %struct.foo definitions round-trip.
-    for (const auto& [name, ty] : module.named_types()) {
-        result.optimised_module->add_named_type(name, ty);
     }
 
     // Functions to process, in module order (independent — safe to optimise in
@@ -390,6 +356,8 @@ PipelineResult::FunctionResult Pipeline::run_on_function(const ir::Function& fn,
     s.last_vector_hash = 0;
     s.last_loop_hash = 0;
     s.last_mem_hash = 0;
+    s.last_prune_hash = 0;
+    s.last_pow2_hash = 0;
     s.rejected_hashes.clear();
 
     // Arm a local deadline if run_on_function() was called directly
@@ -464,15 +432,18 @@ PipelineResult::FunctionResult Pipeline::run_on_function(const ir::Function& fn,
             auto vector_candidates = vector_phase(*current, s);
 
             // Stage 1.6: loop optimisation (LICM + constant-trip full
-            // unrolling), Stage 1.7: alias-aware memory optimisation, and
-            // Stage 1.8: dataflow pruning (DCE + unreachable-block
-            // elimination + known-bits constant/branch folding). All
-            // three are deterministic, sound-by-construction, and cheap —
-            // and their rewrites COMPOUND with the rest of the round: an
-            // unrolled loop or a forwarded load becomes straight-line
-            // integer code the miner can then prove rewrites for, and a
-            // smaller pruned baseline is cheaper for every phase for the
-            // REST of this round and every round after.
+            // unrolling), Stage 1.7: alias-aware memory optimisation,
+            // Stage 1.8: dataflow pruning (DCE + same-block CSE +
+            // unreachable-block elimination + known-bits constant/branch
+            // folding), and Stage 1.9: powers-of-two strength reduction
+            // (`x urem y` -> `x and (y-1)` when y is provably a nonzero
+            // power of two, including at runtime). All four are
+            // deterministic, sound-by-construction, and cheap — and their
+            // rewrites COMPOUND with the rest of the round: an unrolled
+            // loop or a forwarded load becomes straight-line integer code
+            // the miner can then prove rewrites for, and a smaller pruned
+            // baseline is cheaper for every phase for the REST of this
+            // round and every round after.
             {
                 auto loop_candidates = loop_phase(*current, s);
                 vector_candidates.insert(
@@ -489,6 +460,11 @@ PipelineResult::FunctionResult Pipeline::run_on_function(const ir::Function& fn,
                     vector_candidates.end(),
                     std::make_move_iterator(prune_candidates.begin()),
                     std::make_move_iterator(prune_candidates.end()));
+                auto pow2_candidates = pow2_phase(*current, s);
+                vector_candidates.insert(
+                    vector_candidates.end(),
+                    std::make_move_iterator(pow2_candidates.begin()),
+                    std::make_move_iterator(pow2_candidates.end()));
             }
 
             // Stage 2: Stochastic search from the current baseline.
@@ -553,7 +529,7 @@ PipelineResult::FunctionResult Pipeline::run_on_function(const ir::Function& fn,
                 current = best;
                 stagnant = 0;
                 ++result.improvements_adopted;
-                if (config_.verbose) {
+                if (config_.verbose && should_log_verbose("round", fn.name())) {
                     std::cerr << "  [round " << round << "] " << fn.name()
                               << ": adopted improvement"
                               << (result.verified ? " (verified)" : " (unverified)")
@@ -865,7 +841,8 @@ std::vector<search::Candidate> Pipeline::mining_phase(const ir::Function& fn,
         rewritten = mcfg.use_path_conditions
                         ? miner.mine_with_path_conditions(fn, &whole_fn_proven)
                         : miner.harvest_and_rewrite(fn, &whole_fn_proven);
-        if (rewritten && *rewritten && config_.verbose) {
+        if (rewritten && *rewritten && config_.verbose &&
+            should_log_verbose("harvest", fn.name())) {
             std::cerr << "  [harvest] " << fn.name() << ": harvesting found "
                       << miner.stats().harvest_rewrites_applied << " splice(s) ("
                       << miner.stats().pc_slices_mined << " under path conditions)\n";
@@ -888,7 +865,7 @@ std::vector<search::Candidate> Pipeline::mining_phase(const ir::Function& fn,
     // reported honestly as unverified.
     cand.sound = whole_fn_proven;
 
-    if (config_.verbose) {
+    if (config_.verbose && should_log_verbose("mine", fn.name())) {
         std::cerr << "  [mine] " << fn.name() << ": peephole miner applied "
                   << miner.stats().rewrites_applied << " slice rewrite(s)\n";
     }
@@ -937,7 +914,7 @@ std::vector<search::Candidate> Pipeline::vector_phase(const ir::Function& fn,
     cand.structural_hash = search::StochasticSearch::structural_hash(*rewritten);
     cand.sound = proven;
 
-    if (config_.verbose) {
+    if (config_.verbose && should_log_verbose("vector", fn.name())) {
         std::cerr << "  [vector] " << fn.name() << ": synthesised "
                   << synth.stats().lane_fusions << " vector op(s), "
                   << synth.stats().reductions << " reduction intrinsic(s), "
@@ -992,7 +969,7 @@ std::vector<search::Candidate> Pipeline::loop_phase(const ir::Function& fn,
     auto unrolled = lopt.unroll_constant_loops(hoisted ? *hoisted : fn);
     push(unrolled, "constant-trip loop unrolling (sound)");
 
-    if (config_.verbose && !out.empty()) {
+    if (config_.verbose && !out.empty() && should_log_verbose("loop", fn.name())) {
         std::cerr << "  [loop] " << fn.name() << ": hoisted "
                   << lopt.stats().instructions_hoisted << " instruction(s), unrolled "
                   << lopt.stats().loops_unrolled << " loop(s) ("
@@ -1025,7 +1002,7 @@ std::vector<search::Candidate> Pipeline::mem_phase(const ir::Function& fn,
     cand.structural_hash = search::StochasticSearch::structural_hash(*rewritten);
     cand.sound = true;  // exact under the conservative alias oracle
 
-    if (config_.verbose) {
+    if (config_.verbose && should_log_verbose("mem", fn.name())) {
         std::cerr << "  [mem] " << fn.name() << ": forwarded "
                   << mopt.stats().loads_forwarded << " store(s)-to-load, eliminated "
                   << mopt.stats().loads_eliminated << " redundant load(s), "
@@ -1068,14 +1045,58 @@ std::vector<search::Candidate> Pipeline::dataflow_prune_phase(const ir::Function
     // transforms) — same trust tier as loop_phase/mem_phase.
     cand.sound = true;
 
-    if (config_.verbose) {
+    if (config_.verbose && should_log_verbose("prune", fn.name())) {
         std::cerr << "  [prune] " << fn.name() << ": removed "
                   << stats.instructions_removed << " dead instruction(s), "
                   << stats.blocks_removed << " unreachable block(s); folded "
                   << stats.values_folded_constant << " known-constant value(s), "
                   << stats.comparisons_folded << " comparison(s), "
                   << stats.redundant_masks_removed << " redundant mask(s), "
-                  << stats.branches_simplified << " branch(es)\n";
+                  << stats.branches_simplified << " branch(es); deduplicated "
+                  << stats.subexpressions_eliminated << " common subexpression(s)\n";
+    }
+
+    std::vector<search::Candidate> out;
+    out.push_back(std::move(cand));
+    return out;
+}
+
+// ── pow2_phase (powers-of-two strength reduction) ────────────────────────
+// `x urem y` -> `x and (y - 1)` wherever the PowersOfTwo analysis (see
+// clunk/Analysis/PowersOfTwo.h) proves y is a nonzero power of two — see
+// clunk/IR/StrengthReduce.h for the full soundness argument. Sound by
+// construction — same trust tier as loop_phase/mem_phase/
+// dataflow_prune_phase above.
+
+std::vector<search::Candidate> Pipeline::pow2_phase(const ir::Function& fn,
+                                                     Searchers& s) {
+    if (config_.opt_level < 2) return {};
+    if (!config_.enable_pow2_strength_reduce) return {};
+    if (remaining_seconds() <= 0.05) return {};
+
+    const uint64_t h = search::StochasticSearch::structural_hash(fn);
+    if (h == s.last_pow2_hash) return {};
+    s.last_pow2_hash = h;
+
+    ir::StrengthReduceStats stats;
+    auto rewritten = ir::simplify_pow2_strength_reduce(fn, &stats);
+    if (!rewritten) return {};
+
+    search::Candidate cand;
+    cand.function = rewritten;
+    cand.score = eval_engine_.analyse(*rewritten).score;
+    cand.iteration_found = 0;
+    cand.description = "powers-of-two strength reduction (urem -> and, sound)";
+    cand.structural_hash = search::StochasticSearch::structural_hash(*rewritten);
+    // Exact by construction: `x urem y == x and (y-1)` for every possible
+    // x whenever y truly is a nonzero power of two, which is exactly what
+    // the PowersOfTwo analysis proved before this rewrite fired.
+    cand.sound = true;
+
+    if (config_.verbose && should_log_verbose("pow2", fn.name())) {
+        std::cerr << "  [pow2] " << fn.name() << ": rewrote "
+                  << stats.urem_to_and
+                  << " urem-by-power-of-two into and-mask form\n";
     }
 
     std::vector<search::Candidate> out;
@@ -1129,7 +1150,7 @@ std::vector<search::Candidate> Pipeline::egraph_phase(const ir::Function& fn,
     // (where most functions have memory ops).
     opt->sound = true;
 
-    if (config_.verbose) {
+    if (config_.verbose && should_log_verbose("egraph", fn.name())) {
         std::cerr << "  [egraph] " << fn.name()
                   << ": equality-saturation produced a candidate (score="
                   << opt->score << ")\n";
@@ -1179,7 +1200,7 @@ std::shared_ptr<ir::Function> Pipeline::verify_and_select(
                 chash = search::StochasticSearch::structural_hash(*cand.function);
             }
             if (s.rejected_hashes.count(chash)) {
-                if (config_.verbose) {
+                if (config_.verbose && should_log_verbose("verify-skip", original.name())) {
                     std::cerr << "  [verify] " << original.name()
                               << ": skipping already-rejected candidate (hash="
                               << chash << ")\n";
@@ -1220,7 +1241,7 @@ std::shared_ptr<ir::Function> Pipeline::verify_and_select(
                 ratio = mca_.compare(current, *sc.candidate->function);
             }
             if (ratio > 0.0 && ratio <= 1.0) {
-                if (config_.verbose) {
+                if (config_.verbose && should_log_verbose("mca-drop", original.name())) {
                     std::cerr << "  [mca] " << original.name()
                               << ": dropped a candidate llvm-mca measures at "
                               << ratio << "x baseline\n";
@@ -1294,7 +1315,7 @@ std::shared_ptr<ir::Function> Pipeline::verify_and_select(
     }
     // Souper-style soundness (default): improving candidates existed but
     // none carried a proof — keep the current baseline.
-    if (config_.verbose) {
+    if (config_.verbose && should_log_verbose("verify-unprovable", original.name())) {
         std::cerr << "  [verify] " << original.name() << ": " << scored.size()
                   << " improving candidate(s), none provable — rerun with "
                      "--trust-unverified to adopt best-effort\n";
@@ -1345,6 +1366,26 @@ void Pipeline::report_progress(const std::string& stage,
         std::lock_guard<std::mutex> lock(progress_mutex_);
         progress_cb_(stage, fn_name, progress);
     }
+}
+
+// ── should_log_verbose ───────────────────────────────────────────────────
+// See the declaration in Pipeline.h and PipelineConfig::verbose_interval_
+// seconds for the rationale (long runs otherwise flood the console with
+// one near-duplicate line per phase per round).
+
+bool Pipeline::should_log_verbose(const std::string& stage, const std::string& fn_name) {
+    if (config_.verbose_interval_seconds <= 0.0) return true;  // throttling off
+    const std::string key = stage + "|" + fn_name;
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(verbose_mutex_);
+    auto it = last_verbose_emit_.find(key);
+    if (it == last_verbose_emit_.end() ||
+        std::chrono::duration<double>(now - it->second).count() >=
+            config_.verbose_interval_seconds) {
+        last_verbose_emit_[key] = now;
+        return true;
+    }
+    return false;
 }
 
 } // namespace clunk

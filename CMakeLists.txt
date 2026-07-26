@@ -35,7 +35,9 @@ set(CLUNK_SOURCES
     src/IR/LoopAnalysis.cpp
     src/IR/Scalarizer.cpp
     src/IR/DataflowPrune.cpp
+    src/IR/StrengthReduce.cpp
     src/Analysis/KnownBits.cpp
+    src/Analysis/PowersOfTwo.cpp
     src/Parser/IRParser.cpp
     src/Evaluator/Heuristics.cpp
     src/Evaluator/EvaluationEngine.cpp

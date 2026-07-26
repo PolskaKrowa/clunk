@@ -15,10 +15,11 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// Clunk Evolutionary Search — population-based optimisation with
-// crossover and mutation. Escapes local optima that stochastic search
-// can get stuck in.
-
+/*
+ * Clunk Evolutionary Search — population-based optimisation with
+ * crossover and mutation. Escapes local optima that stochastic search
+ * can get stuck in.
+ */
 #include "clunk/Search/EvolutionarySearch.h"
 #include "clunk/Search/StochasticSearch.h"
 #include "clunk/IR/Clone.h"

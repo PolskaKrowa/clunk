@@ -15,12 +15,14 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-// Clunk SMT Verifier — Z3-based equivalence checking.
-// Proves that optimised candidates are semantically equivalent
-// to the original program, ensuring optimisations are safe.
-//
-// Z3 is loaded at runtime via dlopen/dlsym — there is no link-time
-
+/*
+ * Clunk SMT Verifier — Z3-based equivalence checking.
+ * Proves that optimised candidates are semantically equivalent
+ * to the original program, ensuring optimisations are safe.
+ *
+ * Z3 is loaded at runtime via dlopen/dlsym — there is no link-time
+ * dependency on libz3.
+ */
 #include "clunk/IR/Type.h"
 #include "clunk/IR/Value.h"
 #include "clunk/IR/Clone.h"

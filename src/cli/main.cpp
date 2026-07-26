@@ -25,11 +25,13 @@
 #include "clunk/Search/PeepholeMiner.h"
 
 #include <cstdlib>
+#include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 static const char* CLUNK_VERSION = "0.1.0";
@@ -48,6 +50,7 @@ struct CliOptions {
     bool no_vector_synth = false;  // --no-vector-synth: disable vector-intrinsic synthesis
     bool use_mca = false;          // --mca: rank final candidates with llvm-mca
     bool verbose = false;
+    double verbose_interval = 1.0;  // --verbose-interval: throttle seconds (0 = unthrottled)
     bool mine = false;             // --mine: SMT-verified peephole mining -> pattern library
     bool report_json = false;      // --report-json: emit per-function stats as JSON to stdout
     std::string dump_candidates_dir;
@@ -117,6 +120,9 @@ static void print_usage(const char* prog) {
               << "  --mca                     Rank final candidates by measured cycles\n"
               << "                            (llc + llvm-mca; ignored when not installed)\n"
               << "  --verbose                 Verbose output\n"
+              << "  --verbose-interval <s>    Throttle verbose progress lines to at most one\n"
+              << "                            per stage every <s> seconds (default 1; 0 = print\n"
+              << "                            every line, unthrottled — useful for short runs)\n"
               << "  --report-json             Emit per-function stats as a JSON array to stdout\n"
               << "                            (score_original/optimised, improvement, verified);\n"
               << "                            optimised IR then goes only to --output, not stdout\n"
@@ -204,6 +210,13 @@ static CliOptions parse_args(int argc, char* argv[]) {
             opts.use_mca = true;
         } else if (arg == "--verbose" || arg == "-v") {
             opts.verbose = true;
+        } else if (arg == "--verbose-interval") {
+            if (i + 1 < argc) {
+                opts.verbose_interval = std::stod(argv[++i]);
+            } else {
+                std::cerr << "Error: --verbose-interval requires an argument\n";
+                opts.show_help = true;
+            }
         } else if (arg == "--mine") {
             opts.mine = true;
         } else if (arg == "--report-json") {
@@ -565,6 +578,7 @@ int main(int argc, char* argv[]) {
     config.enable_vector_synth = !opts.no_vector_synth;
     config.use_mca_ranker = opts.use_mca;
     config.verbose = opts.verbose;
+    config.verbose_interval_seconds = opts.verbose_interval;
     config.dump_candidates = !opts.dump_candidates_dir.empty();
     config.dump_dir = opts.dump_candidates_dir;
     config.pattern_library_path = opts.pattern_library_path;
@@ -640,12 +654,30 @@ int main(int argc, char* argv[]) {
     // ── Create Pipeline and run ─────────────────────────────────────────
     clunk::Pipeline pipeline(config);
 
-    // Set a progress callback that prints to stderr
+    // Set a progress callback that prints to stderr. The "round" stage
+    // fires once per refinement round — which can be thousands of times
+    // on a long-running superoptimisation — so it's throttled the same
+    // way Pipeline throttles its own internal verbose diagnostics (see
+    // PipelineConfig::verbose_interval_seconds); one-off stage
+    // transitions ("patterns"/"gpu"/"pipeline") always print immediately.
     if (opts.verbose) {
+        auto last_emit = std::make_shared<
+            std::unordered_map<std::string, std::chrono::steady_clock::time_point>>();
+        const double interval = opts.verbose_interval;
         pipeline.set_progress_callback(
-            [](const std::string& stage,
+            [last_emit, interval](const std::string& stage,
                const std::string& function_name,
                double progress) {
+                if (stage == "round" && interval > 0.0) {
+                    const std::string key = stage + "|" + function_name;
+                    const auto now = std::chrono::steady_clock::now();
+                    auto it = last_emit->find(key);
+                    if (it != last_emit->end() &&
+                        std::chrono::duration<double>(now - it->second).count() < interval) {
+                        return;  // too soon since the last "round" tick for this function
+                    }
+                    (*last_emit)[key] = now;
+                }
                 std::cerr << "[" << stage << "] " << function_name
                           << " (" << static_cast<int>(progress * 100) << "%)\n";
             });
