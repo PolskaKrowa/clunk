@@ -10,7 +10,7 @@
 <path d="M0,0 L45,0 L46,2 L46,17 L44,19 L1,19 L0,18 Z " fill="#000000" transform="translate(934,904)"/>  
 </svg>
 
-<\div>
+</div>
 
 **Clunk** is an LLVM IR superoptimiser. It takes LLVM IR (`.ll` files) and
 searches for instruction-level optimisations using stochastic search,
