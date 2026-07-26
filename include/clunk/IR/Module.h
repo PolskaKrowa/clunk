@@ -96,6 +96,52 @@ public:
     void add_module_flag(const ModuleFlag& flag) { module_flags_.push_back(flag); }
     const std::vector<ModuleFlag>& module_flags() const { return module_flags_; }
 
+    // ── Round-trip preservation ───────────────────────────────────────────
+    // The next four fields exist so that constructs clunk does not semantically
+    // understand (but clang needs to recompile the optimised IR) survive the
+    // parse → optimise → emit pipeline verbatim.  Each is stored as the raw
+    // RHS text of its LLVM IR declaration so the emitter can splice it back
+    // without re-parsing.
+
+    // Attribute groups: `attributes #N = { ... }` — the parser captures the
+    // body (the part between { and }) and the emitter regenerates the line.
+    // Functions reference these by `#N` in their trailing attribute list,
+    // so dropping the definition would leave dangling references and clang
+    // would error out with "attribute group #N not found".
+    void add_attribute_group(const std::string& id, const std::string& body) {
+        attribute_groups_[id] = body;
+    }
+    const std::unordered_map<std::string, std::string>& attribute_groups() const {
+        return attribute_groups_;
+    }
+
+    // Named metadata: `!llvm.ident = !{...}`, `!opencl.ocl.version = !{...}`,
+    // `!dbg.cu = !N`, etc.  Keyed by name (without the leading '!').
+    void add_named_metadata(const std::string& name, const std::string& body) {
+        named_metadata_.emplace_back(name, body);
+    }
+    const std::vector<std::pair<std::string, std::string>>& named_metadata() const {
+        return named_metadata_;
+    }
+
+    // Numbered metadata definitions: `!N = !{...}`, `!N = !{!"...", !M}`,
+    // `!N = distinct !{...}`, etc.  Stored as ordered pairs (id, body) so
+    // the emitter can re-emit them in the original order (forward refs to
+    // higher-numbered nodes are legal in LLVM IR, so we don't sort by id).
+    void add_metadata_def(const std::string& id, const std::string& body) {
+        metadata_defs_.emplace_back(id, body);
+    }
+    const std::vector<std::pair<std::string, std::string>>& metadata_defs() const {
+        return metadata_defs_;
+    }
+
+    // Module-level inline assembly: `module asm "..."`.  Each line stored
+    // verbatim (without the `module asm ` prefix).
+    void add_module_asm(const std::string& asm_line) {
+        module_asm_.push_back(asm_line);
+    }
+    const std::vector<std::string>& module_asm() const { return module_asm_; }
+
     // Type context
     TypeContext& type_context() { return type_ctx_; }
 
@@ -106,6 +152,12 @@ public:
     std::shared_ptr<Type> named_type(const std::string& name) const {
         auto it = named_types_.find(name);
         return it != named_types_.end() ? it->second : nullptr;
+    }
+    // Read-only access to the whole named-type map.  Used by the pipeline
+    // to copy named types into the optimised output module so they round-trip
+    // even when no function body references them directly.
+    const std::unordered_map<std::string, std::shared_ptr<Type>>& named_types() const {
+        return named_types_;
     }
 
     // Statistics
@@ -125,6 +177,12 @@ private:
     std::vector<ModuleFlag> module_flags_;
     TypeContext type_ctx_;
     std::unordered_map<std::string, std::shared_ptr<Type>> named_types_;
+
+    // Round-trip preservation (see accessor docs above)
+    std::unordered_map<std::string, std::string> attribute_groups_;            // "#0" -> body
+    std::vector<std::pair<std::string, std::string>> named_metadata_;          // ("llvm.ident", "!{...}")
+    std::vector<std::pair<std::string, std::string>> metadata_defs_;           // ("0", "!{...}")
+    std::vector<std::string> module_asm_;
 };
 
 } // namespace clunk::ir

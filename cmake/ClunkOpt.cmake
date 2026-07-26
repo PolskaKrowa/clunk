@@ -2,32 +2,50 @@
 #
 # Usage:
 #   find_package(Clunk REQUIRED)
+#   include(${Clunk_DIR}/ClunkOpt.cmake)   # if not auto-included
 #   clunk_opt(my_target)
 #
-# This replaces the target's C/C++ source compilations with a
+# This replaces the target's C/C++/Fortran source compilations with a
 # source → LLVM IR → clunk superoptimiser → object file pipeline.
-# Non-C/C++ sources (headers, assembly, .rc, etc.) are left untouched.
+# Non-optimised sources (headers, assembly, .rc, etc.) are left untouched.
 #
-# The original C/C++ sources are removed from the target's source list
-# and replaced with the optimised object files, avoiding duplicate symbols.
+# The original C/C++/Fortran sources are removed from the target's source
+# list and replaced with the optimised object files, avoiding duplicate
+# symbols.
 #
 # Options (set before calling clunk_opt):
-#   CLUNK_TIME_BUDGET     — seconds per source file (default: 10)
-#   CLUNK_OPT_LEVEL       — clunk optimisation level (default: 2)
-#   CLUNK_ENABLE_CACHE    — enable content-hash caching (default: ON)
-#   CLUNK_CACHE_DIR       — override cache directory
-#                           (default: ${CMAKE_BINARY_DIR}/.clunk_cache)
-#   CLUNK_CLANG           — override clang executable path
+#   CLUNK_TIME_BUDGET         — seconds per source file (default: 10)
+#   CLUNK_TOTAL_TIME_BUDGET   — total seconds across all sources in this
+#                               target (default: 0 = no cap).  When the
+#                               per-file estimate exceeds this, the
+#                               per-file budget is scaled down.
+#   CLUNK_OPT_LEVEL           — clunk optimisation level (default: 2)
+#   CLUNK_ENABLE_CACHE        — enable content-hash caching (default: ON)
+#   CLUNK_CACHE_DIR           — override cache directory
+#                               (default: ${CMAKE_BINARY_DIR}/.clunk_cache)
+#   CLUNK_CLANG               — override clang executable (C/C++ sources)
+#   CLUNK_FLANG               — override flang executable (Fortran sources)
+#   CLUNK_USE_COMPILE_COMMANDS — when ON and compile_commands.json exists,
+#                               read per-source compile flags from it
+#                               instead of reconstructing from target
+#                               properties (default: ON).  More accurate
+#                               but requires CMAKE_EXPORT_COMPILE_COMMANDS=ON.
+#
+# Language support:
+#   - C      : .c                          → uses clang
+#   - C++    : .cc .cpp .cxx .c++          → uses clang
+#   - Fortran: .f .f90 .f95 .f03 .f08 .for
+#              .F .F90 .F95 .F03 .F08      → uses flang-new / flang
 #
 # Limitations:
-#   - Compile flags are reconstructed from CMake target properties.
-#     Generator expressions containing $<...> are filtered out.
-#     For complex projects, consider integrating with compile_commands.json.
-#   - Config-specific flags (e.g. CMAKE_CXX_FLAGS_RELEASE) are included
-#     for the active CMAKE_BUILD_TYPE but not for multi-config generators
-#     (Visual Studio, Xcode, Ninja Multi-Config).
+#   - gfortran is NOT supported (it doesn't emit LLVM IR).  If the
+#     project's CMAKE_Fortran_COMPILER is gfortran, clunk_opt() will
+#     search PATH for flang-new and fall back to leaving Fortran
+#     sources unoptimised if flang isn't found.
+#   - compile_commands.json lookup uses python3 (CMake has no built-in
+#     JSON parser).  Falls back to property-walk flags if python3 is absent.
 #   - Caching tracks source content + flags + clunk version; header changes
-#     are not tracked. Use CLUNK_ENABLE_CACHE=OFF during active development.
+#     are not tracked.  Use CLUNK_ENABLE_CACHE=OFF during active development.
 
 # ---------------------------------------------------------------------------
 # Helper: collect INTERFACE compile flags from a target's linked libraries.
@@ -159,8 +177,14 @@ function(clunk_opt target)
     endif()
 
     # ===================================================================
-    # 3. Find clang — prefer the project's own compiler (avoids version
-    #    mismatch), fall back to searching PATH for a clang binary.
+    # 3. Find clang AND flang — we need clang for C/C++ sources and flang
+    #    for Fortran sources.  Both produce LLVM IR via -emit-llvm, which
+    #    is what clunk consumes.
+    #
+    #    Discovery order:
+    #      a) CLUNK_CLANG / CLUNK_FLANG cache variables (user override)
+    #      b) The project's own C/CXX/Fortran compiler (if it's flang/clang)
+    #      c) PATH search for clang / flang-new / flang binaries
     # ===================================================================
     if(NOT DEFINED CLUNK_CLANG OR NOT CLUNK_CLANG)
         set(CLUNK_CLANG "${CMAKE_CXX_COMPILER}")
@@ -173,9 +197,49 @@ function(clunk_opt target)
     endif()
 
     if(NOT CLUNK_CLANG OR NOT EXISTS "${CLUNK_CLANG}")
-        message(WARNING "clunk_opt(${target}): clang not found — cannot emit LLVM IR. "
-                        "Install clang or set CLUNK_CLANG to enable clunk_opt().")
-        return()
+        # clang is only required if the target has C/C++ sources.  We'll
+        # warn-and-skip later if so.  Don't hard-fail here — the target
+        # might be Fortran-only.
+        set(CLUNK_CLANG "")
+    endif()
+
+    # Fortran compiler discovery.  Modern flang is shipped as `flang-new`
+    # (LLVM 13+) or `flang` (LLVM 5+, classic).  We prefer `flang-new`
+    # because classic flang does NOT support -emit-llvm in the way clunk
+    # needs (it goes through a different middle-end).
+    if(NOT DEFINED CLUNK_FLANG OR NOT CLUNK_FLANG)
+        # Try the project's Fortran compiler first.
+        set(CLUNK_FLANG "${CMAKE_Fortran_COMPILER}")
+        if(CLUNK_FLANG AND EXISTS "${CLUNK_FLANG}")
+            # Verify it actually supports -emit-llvm.  gfortran does NOT
+            # (it uses GCC's middle-end, not LLVM).  If the user pointed
+            # CMAKE_Fortran_COMPILER at gfortran, we have to fall back to
+            # searching PATH for flang-new.
+            execute_process(
+                COMMAND "${CLUNK_FLANG}" --version
+                OUTPUT_VARIABLE _flang_version
+                ERROR_QUIET
+                RESULT_VARIABLE _flang_rc
+            )
+            if(_flang_rc EQUAL 0 AND _flang_version MATCHES "flang|LLVM")
+                # Looks like flang — keep it.
+            elseif(_flang_rc EQUAL 0 AND _flang_version MATCHES "GNU Fortran|gfortran")
+                # gfortran — can't emit LLVM IR.  Fall through to PATH search.
+                set(CLUNK_FLANG "")
+            endif()
+        endif()
+
+        if(NOT CLUNK_FLANG OR NOT EXISTS "${CLUNK_FLANG}")
+            find_program(CLUNK_FLANG
+                NAMES flang-new flang flang-19 flang-18 flang-17
+                DOC "Path to flang (LLVM Fortran frontend) — required for clunk_opt() on Fortran sources"
+            )
+        endif()
+    endif()
+
+    if(NOT CLUNK_FLANG OR NOT EXISTS "${CLUNK_FLANG}")
+        # flang is only required if the target has Fortran sources.
+        set(CLUNK_FLANG "")
     endif()
 
     # ===================================================================
@@ -183,6 +247,13 @@ function(clunk_opt target)
     # ===================================================================
     if(NOT DEFINED CLUNK_TIME_BUDGET)
         set(CLUNK_TIME_BUDGET 10)    # seconds per source file
+    endif()
+    if(NOT DEFINED CLUNK_TOTAL_TIME_BUDGET)
+        # Total wall-clock budget across ALL sources in this target.
+        # Default: no cap (per-file CLUNK_TIME_BUDGET is the only limit).
+        # Set this to avoid runaway CI times on large projects — e.g.
+        #   set(CLUNK_TOTAL_TIME_BUDGET 600)   # 10 minutes max per target
+        set(CLUNK_TOTAL_TIME_BUDGET 0)
     endif()
     if(NOT DEFINED CLUNK_OPT_LEVEL)
         set(CLUNK_OPT_LEVEL 2)
@@ -192,6 +263,14 @@ function(clunk_opt target)
     endif()
     if(NOT DEFINED CLUNK_CACHE_DIR)
         set(CLUNK_CACHE_DIR "${CMAKE_BINARY_DIR}/.clunk_cache")
+    endif()
+    # When ON, clunk_opt() reads per-source compile flags from
+    # compile_commands.json (if it exists) instead of reconstructing
+    # them from CMake target properties.  This is more accurate (it
+    # captures generator expressions, transitive dependencies, etc.)
+    # but requires CMAKE_EXPORT_COMPILE_COMMANDS=ON.
+    if(NOT DEFINED CLUNK_USE_COMPILE_COMMANDS)
+        set(CLUNK_USE_COMPILE_COMMANDS ON)
     endif()
 
     # Obtain clunk version string for cache key invalidation
@@ -207,8 +286,8 @@ function(clunk_opt target)
     endif()
 
     # ===================================================================
-    # 5. Get target sources — separate C/C++ (to be replaced) from
-    #    everything else (headers, assembly, .rc, .manifest, etc.)
+    # 5. Get target sources — separate C/C++/Fortran (to be replaced)
+    #    from everything else (headers, assembly, .rc, .manifest, etc.)
     # ===================================================================
     get_target_property(_all_sources "${target}" SOURCES)
     if(NOT _all_sources)
@@ -216,25 +295,52 @@ function(clunk_opt target)
         return()
     endif()
 
-    set(_c_sources "")       # Sources that go through the clunk pipeline
-    set(_non_c_sources "")   # Everything else — stays in the target
+    set(_opt_sources "")       # Sources that go through the clunk pipeline
+    set(_non_opt_sources "")   # Everything else — stays in the target
 
+    # Recognised source extensions:
+    #   C       : .c
+    #   C++     : .cc .cpp .cxx .c++
+    #   Fortran : .f .f90 .f95 .f03 .f08 .for .fpp .F .F90 .F95 .F03 .F08
+    # Capital .F* means run the preprocessor (flang handles this automatically).
     foreach(_src ${_all_sources})
         string(TOLOWER "${_src}" _src_lower)
-        if(_src_lower MATCHES "\\.(c|cc|cpp|cxx|c\\+\\+)$")
-            list(APPEND _c_sources "${_src}")
+        if(_src_lower MATCHES "\\.(c|cc|cpp|cxx|c\\+\\+)$" OR
+           _src_lower MATCHES "\\.(f|f90|f95|f03|f08|for|fpp|f15|f18)$" OR
+           _src      MATCHES "\\.[Ff][Pp]?[Pp]?[0958]*$")
+            list(APPEND _opt_sources "${_src}")
         else()
-            list(APPEND _non_c_sources "${_src}")
+            list(APPEND _non_opt_sources "${_src}")
         endif()
     endforeach()
 
-    if(NOT _c_sources)
-        message(STATUS "Clunk: clunk_opt(${target}) — no C/C++ sources found, skipping")
+    if(NOT _opt_sources)
+        message(STATUS "Clunk: clunk_opt(${target}) — no C/C++/Fortran sources found, skipping")
         return()
     endif()
 
-    list(LENGTH _c_sources _num_sources)
-    math(EXPR _estimate_seconds "${_num_sources} * ${CLUNK_TIME_BUDGET}")
+    list(LENGTH _opt_sources _num_sources)
+
+    # ── Per-file time budget with total cap ──────────────────────────────
+    # If CLUNK_TOTAL_TIME_BUDGET is set and the naive per-file estimate
+    # would exceed it, scale down the per-file budget.  This prevents a
+    # 200-file target from running for 200 × 30s = 100 minutes when the
+    # user only budgeted 10 minutes for the whole target.
+    set(_per_file_budget "${CLUNK_TIME_BUDGET}")
+    if(CLUNK_TOTAL_TIME_BUDGET GREATER 0)
+        math(EXPR _naive_total "${_num_sources} * ${CLUNK_TIME_BUDGET}")
+        if(_naive_total GREATER CLUNK_TOTAL_TIME_BUDGET)
+            # Scale down per-file budget so total fits.
+            math(EXPR _per_file_budget "${CLUNK_TOTAL_TIME_BUDGET} / ${_num_sources}")
+            if(_per_file_budget LESS 1)
+                set(_per_file_budget 1)
+            endif()
+            message(STATUS "Clunk: clunk_opt(${target}) — total budget ${CLUNK_TOTAL_TIME_BUDGET}s "
+                           "across ${_num_sources} files; scaling per-file budget to ${_per_file_budget}s")
+        endif()
+    endif()
+
+    math(EXPR _estimate_seconds "${_num_sources} * ${_per_file_budget}")
 
     message(STATUS "Clunk: clunk_opt(${target}) — ${_num_sources} source file(s), "
                    "estimated ${_estimate_seconds}s optimisation time")
@@ -337,11 +443,44 @@ function(clunk_opt target)
         endif()
     endif()
 
+    # Fortran base flags — same pattern as C/C++ above.
+    # Note: flang-new accepts the same -std=f2008 / -std=f2018 syntax as
+    # gfortran, so we don't need separate dialect handling.
+    set(_fortran_base_flags "${CMAKE_Fortran_FLAGS}")
+    if(_build_type_upper)
+        set(_fortran_bt "${CMAKE_Fortran_FLAGS_${_build_type_upper}}")
+        if(_fortran_bt)
+            string(APPEND _fortran_base_flags " ${_fortran_bt}")
+        endif()
+    endif()
+
+    # Fortran_STANDARD (CMake 3.25+; older CMakes don't set this and we
+    # fall back to whatever -std= flag is in CMAKE_Fortran_FLAGS).
+    set(_fortran_std_flag "")
+    get_target_property(_fortran_std "${target}" Fortran_STANDARD)
+    if(_fortran_std)
+        set(_fortran_std_flag "-std=f${_fortran_std}")
+    endif()
+
     # --- 6b. Interface properties from linked libraries ---
     _clunk_collect_interface_flags(_common_flags "${target}")
 
     # --- 6c. Code-generation flags for .ll → .o step ---
     _clunk_extract_codegen_flags(_cg_flags _raw_compile_opts _need_pic)
+
+    # --- 6d. compile_commands.json (optional but more accurate) --------
+    # When CMAKE_EXPORT_COMPILE_COMMANDS is ON and the file exists, we
+    # query it for the exact compile command CMake recorded for each
+    # source file.  This captures generator expressions, transitive
+    # INTERFACE_* flags, and per-source overrides that the property-walk
+    # above can miss.  The lookup happens per-source inside the loop.
+    set(_compile_commands_json "")
+    if(CLUNK_USE_COMPILE_COMMANDS)
+        set(_compile_commands_json "${CMAKE_BINARY_DIR}/compile_commands.json")
+        if(NOT EXISTS "${_compile_commands_json}")
+            set(_compile_commands_json "")
+        endif()
+    endif()
 
     # ===================================================================
     # 7. Create working directory and (optionally) cache directory
@@ -358,7 +497,7 @@ function(clunk_opt target)
     # ===================================================================
     set(_optimised_objs "")
 
-    foreach(_src ${_c_sources})
+    foreach(_src ${_opt_sources})
 
         # --- Absolute source path ---
         if(IS_ABSOLUTE "${_src}")
@@ -376,21 +515,106 @@ function(clunk_opt target)
         endif()
 
         # --- Determine language from file extension ---
+        # Sets _lang, _lang_base_flags, _lang_std_flag, _lang_compiler.
         string(TOLOWER "${_src}" _src_lower)
+        set(_lang_compiler "")
         if(_src_lower MATCHES "\\.c$")
             set(_lang "C")
             set(_lang_base_flags "${_c_base_flags}")
             set(_lang_std_flag   "${_c_std_flag}")
-        else()
+            set(_lang_compiler   "${CLUNK_CLANG}")
+        elseif(_src_lower MATCHES "\\.(cc|cpp|cxx|c\\+\\+)$")
             set(_lang "CXX")
             set(_lang_base_flags "${_cxx_base_flags}")
             set(_lang_std_flag   "${_cxx_std_flag}")
+            set(_lang_compiler   "${CLUNK_CLANG}")
+        elseif(_src_lower MATCHES "\\.(f|f90|f95|f03|f08|for|fpp|f15|f18)$" OR
+               _src      MATCHES "\\.[Ff][Pp]?[Pp]?[0958]*$")
+            set(_lang "Fortran")
+            set(_lang_base_flags "${_fortran_base_flags}")
+            set(_lang_std_flag   "${_fortran_std_flag}")
+            set(_lang_compiler   "${CLUNK_FLANG}")
+        else()
+            # Shouldn't happen — classifier above already filtered.
+            continue()
+        endif()
+
+        # --- Skip if we don't have a compiler for this language ---
+        if(NOT _lang_compiler OR NOT EXISTS "${_lang_compiler}")
+            message(WARNING "Clunk: clunk_opt(${target}) — no ${_lang} compiler found "
+                            "for ${_src}; passing it through unoptimised.")
+            list(APPEND _non_opt_sources "${_src}")
+            continue()
         endif()
 
         # --- Assemble full flags for source → IR step ---
+        # Default: reconstruct from target properties.
         set(_ir_flags "${_common_flags} ${_lang_base_flags}")
         if(_lang_std_flag)
             string(APPEND _ir_flags " ${_lang_std_flag}")
+        endif()
+
+        # ── compile_commands.json override ─────────────────────────────
+        # If the user enabled CLUNK_USE_COMPILE_COMMANDS and the database
+        # exists, look up the exact compile command CMake recorded for
+        # this source.  This is more accurate than the property walk
+        # above — it captures generator expressions, transitive deps,
+        # and per-source overrides.
+        #
+        # We use a Python one-liner (CMake has no built-in JSON parser
+        # before 3.19, and even then it's experimental).  If Python
+        # isn't available, fall back to the property-walk flags.
+        if(_compile_commands_json)
+            execute_process(
+                COMMAND python3 -c
+                    "import json,sys; \
+                     db=json.load(open(sys.argv[1])); \
+                     target=sys.argv[2]; src=sys.argv[3]; \
+                     for e in db: \
+                         if e.get('file','').endswith(src.split('/')[-1]) and target in e.get('command',''): \
+                             print(e['command']); break"
+                    "${_compile_commands_json}" "${target}" "${_src_abs}"
+                OUTPUT_VARIABLE _cc_cmd
+                RESULT_VARIABLE _cc_rc
+                ERROR_QUIET
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+            )
+            if(_cc_rc EQUAL 0 AND _cc_cmd)
+                # Strip the leading compiler invocation and the source
+                # file argument; keep everything else as flags.
+                # _cc_cmd looks like:  /usr/bin/clang -c -DFOO=1 ... /path/to/src.c -o src.o
+                # We want: -DFOO=1 ... (everything between the compiler and the source path)
+                string(REPLACE " " ";" _cc_tokens "${_cc_cmd}")
+                set(_cc_flags "")
+                set(_skip_next FALSE)
+                set(_seen_compiler FALSE)
+                foreach(_tok ${_cc_tokens})
+                    if(NOT _seen_compiler)
+                        set(_seen_compiler TRUE)
+                        continue()
+                    endif()
+                    if(_tok STREQUAL "-o")
+                        set(_skip_next TRUE)
+                        continue()
+                    endif()
+                    if(_skip_next)
+                        set(_skip_next FALSE)
+                        continue()
+                    endif()
+                    # Stop at the source file path (absolute or matching _src)
+                    if(_tok STREQUAL "${_src_abs}" OR _tok STREQUAL "${_src}")
+                        break()
+                    endif()
+                    # Skip -c (we're using -S -emit-llvm instead)
+                    if(_tok STREQUAL "-c")
+                        continue()
+                    endif()
+                    string(APPEND _cc_flags " ${_tok}")
+                endforeach()
+                if(_cc_flags)
+                    set(_ir_flags "${_cc_flags}")
+                endif()
+            endif()
         endif()
 
         # --- Derive unique output file paths ---
@@ -437,11 +661,16 @@ function(clunk_opt target)
             )
         else()
             # ---- Full pipeline: source → IR → clunk → object ----
+            # Use the language-appropriate compiler for both the
+            # source → IR step AND the IR → object step.  clang can
+            # recompile flang-emitted IR (and vice versa) because LLVM
+            # IR is language-agnostic, but using the same compiler
+            # avoids subtle ABI mismatches in Fortran runtime support.
 
             # Step 1: source → LLVM IR
             add_custom_command(
                 OUTPUT  "${_ll_file}"
-                COMMAND "${CLUNK_CLANG}" -S -emit-llvm ${_ir_flags}
+                COMMAND "${_lang_compiler}" -S -emit-llvm ${_ir_flags}
                         -o "${_ll_file}" "${_src_abs}"
                 DEPENDS "${_src_abs}"
                 COMMENT "Clunk: emitting LLVM IR for ${_src}"
@@ -449,11 +678,13 @@ function(clunk_opt target)
             )
 
             # Step 2: Run clunk superoptimiser
+            # Uses _per_file_budget (may be lower than CLUNK_TIME_BUDGET
+            # if CLUNK_TOTAL_TIME_BUDGET forced scaling).
             add_custom_command(
                 OUTPUT  "${_opt_ll}"
                 COMMAND "${CLUNK_EXECUTABLE}"
                         --opt-level ${CLUNK_OPT_LEVEL}
-                        --time-budget ${CLUNK_TIME_BUDGET}
+                        --time-budget ${_per_file_budget}
                         --output "${_opt_ll}" "${_ll_file}"
                 DEPENDS "${_ll_file}" "${CLUNK_EXECUTABLE}"
                 COMMENT "Clunk: optimising ${_src}"
@@ -461,10 +692,12 @@ function(clunk_opt target)
             )
 
             # Step 3: optimised IR → object file (+ optional cache store)
+            # We use _lang_compiler (NOT CLUNK_CLANG) here so flang IR
+            # is recompiled by flang, preserving Fortran runtime linkage.
             if(CLUNK_ENABLE_CACHE AND _cached_obj)
                 add_custom_command(
                     OUTPUT  "${_obj_file}"
-                    COMMAND "${CLUNK_CLANG}" -c ${_cg_flags}
+                    COMMAND "${_lang_compiler}" -c ${_cg_flags}
                             "${_opt_ll}" -o "${_obj_file}"
                     COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                             "${_obj_file}" "${_cached_obj}"
@@ -475,7 +708,7 @@ function(clunk_opt target)
             else()
                 add_custom_command(
                     OUTPUT  "${_obj_file}"
-                    COMMAND "${CLUNK_CLANG}" -c ${_cg_flags}
+                    COMMAND "${_lang_compiler}" -c ${_cg_flags}
                             "${_opt_ll}" -o "${_obj_file}"
                     DEPENDS "${_opt_ll}"
                     COMMENT "Clunk: compiling optimised ${_src}"
@@ -507,14 +740,15 @@ function(clunk_opt target)
     #    optimised objects ON TOP of the original objects, causing every
     #    symbol to be defined twice.
     #
-    #    FIX: remove all C/C++ sources from the target's source list
-    #    and replace them with the optimised object files.
+    #    FIX: remove all C/C++/Fortran sources from the target's source
+    #    list and replace them with the optimised object files.
     #
     #    set_target_properties(SOURCES ...) replaces the entire source
-    #    list, so we must include ALL non-C/C++ sources (headers, .rc,
-    #    .manifest, .asm, etc.) to avoid dropping them accidentally.
+    #    list, so we must include ALL non-optimised sources (headers,
+    #    .rc, .manifest, .asm, skipped-due-to-no-compiler, etc.) to
+    #    avoid dropping them accidentally.
     # ===================================================================
-    set_target_properties("${target}" PROPERTIES SOURCES "${_non_c_sources}")
+    set_target_properties("${target}" PROPERTIES SOURCES "${_non_opt_sources}")
     target_sources("${target}" PRIVATE ${_optimised_objs})
 
     # ===================================================================

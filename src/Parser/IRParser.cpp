@@ -552,14 +552,33 @@ void IRParser::parse_module(std::shared_ptr<ir::Module> mod) {
                 parse_llvm_module_flags(mod);
                 continue;
             }
+            // Named metadata definition: !<name> = !{ ... }
+            // (e.g. !llvm.ident, !opencl.ocl.version, !dbg.cu, !llvm.dbg.cu)
+            if (pos_ + 1 < tokens_.size() &&
+                tokens_[pos_ + 1].type == TokenType::Identifier &&
+                pos_ + 2 < tokens_.size() &&
+                tokens_[pos_ + 2].type == TokenType::Punctuation &&
+                tokens_[pos_ + 2].text == "=") {
+                parse_named_metadata(mod);
+                continue;
+            }
             // Check for !N = !{ i32 <behavior>, !"key", ... } (module flag entry)
             if (pos_ + 1 < tokens_.size() &&
                 tokens_[pos_ + 1].type == TokenType::Number) {
                 if (try_parse_module_flag_entry(mod)) {
                     continue;
                 }
+                // Not a module-flag entry — but might be a plain !N = !{...}
+                // metadata definition. parse_metadata_def will detect and
+                // consume it; if it doesn't match either form, fall through.
+                if (pos_ + 2 < tokens_.size() &&
+                    tokens_[pos_ + 2].type == TokenType::Punctuation &&
+                    tokens_[pos_ + 2].text == "=") {
+                    parse_metadata_def(mod);
+                    continue;
+                }
             }
-            // Silently consume the entire metadata line/construct
+            // Bare metadata attachment (no '=') — silently consume
             skip_metadata();
             // If there's an '=' after, skip the rest until the next top-level construct
             if (peek_token().type == TokenType::Punctuation && peek_token().text == "=") {
@@ -595,7 +614,9 @@ void IRParser::parse_module(std::shared_ptr<ir::Module> mod) {
         }
 
         // source_filename = "..."
-        if (tok.type == TokenType::Identifier && tok.text == "source_filename") {
+        // Note: `source_filename` is in llvm_keywords, so the lexer
+        // classifies it as a Keyword — not an Identifier.
+        if (tok.type == TokenType::Keyword && tok.text == "source_filename") {
             next_token(); // consume 'source_filename'
             match(TokenType::Punctuation, "=");
             if (peek_token().type == TokenType::String) {
@@ -647,21 +668,16 @@ void IRParser::parse_module(std::shared_ptr<ir::Module> mod) {
         }
 
         // Attributes group: attributes #N = { ... }
+        // Capture verbatim so function references like `define ... #0 { }`
+        // still resolve after round-trip.
         if (tok.type == TokenType::Keyword && tok.text == "attributes") {
-            while (peek_token().type != TokenType::Eof) {
-                auto t = next_token();
-                if (t.type == TokenType::Punctuation && t.text == "}") break;
-            }
+            parse_attribute_group(mod);
             continue;
         }
 
         // module asm "..."
         if (tok.type == TokenType::Keyword && tok.text == "module") {
-            while (peek_token().type != TokenType::Eof &&
-                   peek_token().type != TokenType::Keyword &&
-                   !(peek_token().type == TokenType::Punctuation && peek_token().text == "@")) {
-                next_token();
-            }
+            parse_module_asm(mod);
             continue;
         }
 
@@ -803,9 +819,46 @@ void IRParser::parse_function_decl(std::shared_ptr<ir::Module> mod) {
     // Arguments: ( ... )
     expect(TokenType::Punctuation, "(");
     std::vector<std::shared_ptr<ir::Type>> param_types;
+    // Track per-argument parameter attributes so we can re-emit them on
+    // declarations.  Previously declarations dropped parameter attributes
+    // like `noundef`, `noalias`, `readonly` — which clang then warned
+    // about as a signature mismatch on link.
+    struct DeclArg {
+        std::shared_ptr<ir::Type> type;
+        std::unordered_map<std::string, std::string> attrs;
+    };
+    std::vector<DeclArg> decl_args;
+
+    auto collect_decl_param_attrs = [this](std::unordered_map<std::string, std::string>& attrs) {
+        while (peek_token().type == TokenType::Keyword) {
+            std::string kw = peek_token().text;
+            next_token();
+            // Record the aliasing-relevant attrs the memory optimiser
+            // cares about; everything else is silently consumed.
+            if (kw == "noalias" || kw == "readonly" || kw == "readnone" ||
+                kw == "nocapture" || kw == "noundef" || kw == "nonnull" ||
+                kw == "writeonly" || kw == "noalias" || kw == "returned" ||
+                kw == "inreg" || kw == "signext" || kw == "zeroext") {
+                attrs[kw] = "true";
+            }
+            if (peek_token().type == TokenType::Punctuation && peek_token().text == "(") {
+                skip_balanced('(', ')');
+            }
+            if (kw == "align" && peek_token().type == TokenType::Number) {
+                attrs["align"] = peek_token().text;
+                next_token();
+            }
+            if (kw == "dereferenceable" && peek_token().type == TokenType::Punctuation &&
+                peek_token().text == "(") {
+                skip_balanced('(', ')');
+            }
+        }
+    };
+
     while (!(peek_token().type == TokenType::Punctuation && peek_token().text == ")")) {
-        // Skip parameter attributes
-        skip_param_attrs();
+        DeclArg arg;
+        // Parameter attributes before the type (noundef, noalias, etc.)
+        collect_decl_param_attrs(arg.attrs);
 
         // Vararg: ...
         if (peek_token().type == TokenType::Punctuation && peek_token().text == "...") {
@@ -816,52 +869,40 @@ void IRParser::parse_function_decl(std::shared_ptr<ir::Module> mod) {
             continue;
         }
 
-        auto ptype = parse_type();
-        param_types.push_back(ptype);
+        arg.type = parse_type();
+        param_types.push_back(arg.type);
         // Attributes can also appear between type and name
-        skip_param_attrs();
-        // Skip parameter name if present (%name)
+        collect_decl_param_attrs(arg.attrs);
+        // Skip parameter name if present (%name) — declarations usually
+        // don't name their parameters, but it's legal.
         if (peek_token().type == TokenType::Punctuation && peek_token().text == "%") {
             next_token(); // '%'
             next_token(); // name
         }
+        decl_args.push_back(std::move(arg));
+
         if (peek_token().type == TokenType::Punctuation && peek_token().text == ",") {
             next_token();
         }
     }
     expect(TokenType::Punctuation, ")");
 
-    // Skip trailing attributes (#0, nounwind, uwtable, etc.)
-    // Be careful NOT to consume keywords that start new top-level constructs.
-    static const std::unordered_set<std::string> top_level_keywords = {
-        "define", "declare", "target", "attributes", "module", "source_filename"
-    };
-    while (true) {
-        auto tok = peek_token();
-        if (tok.type == TokenType::Punctuation && !tok.text.empty() && tok.text[0] == '#') {
-            next_token();
-        } else if (tok.type == TokenType::Punctuation && tok.text == "!") {
-            skip_metadata();
-        } else if (tok.type == TokenType::Keyword && !top_level_keywords.count(tok.text)) {
-            next_token();
-            // Handle key=value pairs like frame-pointer="all"
-            if (peek_token().type == TokenType::Punctuation && peek_token().text == "=") {
-                next_token(); // consume '='
-                next_token(); // consume value
-            }
-        } else if (tok.type == TokenType::String) {
-            next_token();
-            if (peek_token().type == TokenType::Punctuation && peek_token().text == "=") {
-                next_token();
-                next_token();
-            }
-        } else {
-            break;
-        }
-    }
+    // Collect trailing function attributes (#0, nounwind, uwtable, etc.)
+    // so they round-trip.  Previously these were silently dropped, which
+    // meant a `declare void @foo() #0` re-emitted as `declare void @foo()`
+    // — losing the attribute-group reference and breaking clang recompilation.
+    auto func_attrs = collect_function_attrs();
 
     auto fn_type = std::make_shared<ir::FunctionType>(ret_type, param_types);
     auto fn = std::make_shared<ir::Function>(fn_name, fn_type);
+    for (const auto& a : func_attrs) fn->add_function_attribute(a);
+    // Add arguments to the function so the emitter can render them.
+    // Without this, `declare void @foo(i32 noundef)` was re-emitted as
+    // `declare void @foo()` — losing the parameter list and breaking
+    // clang's signature-mismatch check at link time.
+    for (const auto& arg : decl_args) {
+        fn->add_argument(arg.type, "", arg.attrs);
+    }
     mod->add_function(fn);
 }
 
@@ -2326,7 +2367,19 @@ void IRParser::parse_llvm_module_flags(std::shared_ptr<ir::Module> mod) {
 
 // ── try_parse_module_flag_entry() ──────────────────────────────────────────
 // Attempt to parse: !N = !{ i32 <behavior>, !"<key>", <value> }
-// Returns true if a module flag entry was found and captured, false otherwise.
+//
+// Returns:
+//   - true  if a valid module flag entry was found AND captured.
+//   - true  if the construct parsed as `!N = !{...}` (or `!N = !{ !... }`)
+//           but did NOT match the module-flag shape — in that case we
+//           still consumed the tokens, but we ALSO stored the metadata as
+//           a generic numbered metadata def so it round-trips.  The
+//           dispatcher's follow-up parse_metadata_def() is therefore not
+//           needed (and would do nothing, since pos_ has advanced past
+//           the construct).
+//   - false if the input did not even look like `!N = !{...}`; in that
+//           case pos_ is rewound to saved_pos so the dispatcher can try
+//           other parsers.
 bool IRParser::try_parse_module_flag_entry(std::shared_ptr<ir::Module> mod) {
     // Current token is '!', next should be a Number
     if (!(peek_token().type == TokenType::Punctuation && peek_token().text == "!"))
@@ -2338,6 +2391,8 @@ bool IRParser::try_parse_module_flag_entry(std::shared_ptr<ir::Module> mod) {
         pos_ = saved_pos;
         return false;
     }
+    auto id_tok = peek_token();
+    std::string id = id_tok.text;
     next_token(); // consume the number (metadata ID)
 
     if (!(peek_token().type == TokenType::Punctuation && peek_token().text == "=")) {
@@ -2345,6 +2400,13 @@ bool IRParser::try_parse_module_flag_entry(std::shared_ptr<ir::Module> mod) {
         return false;
     }
     next_token(); // consume '='
+
+    // Optional `distinct` keyword before the body.
+    std::string distinct_prefix;
+    if (peek_token().type == TokenType::Identifier && peek_token().text == "distinct") {
+        distinct_prefix = "distinct ";
+        next_token();
+    }
 
     // Expect !{ ... }
     if (!(peek_token().type == TokenType::Punctuation && peek_token().text == "!")) {
@@ -2365,13 +2427,27 @@ bool IRParser::try_parse_module_flag_entry(std::shared_ptr<ir::Module> mod) {
     bool found = false;
 
     // First element: i32 <behavior>
-    if (peek_token().type == TokenType::Identifier &&
-        (peek_token().text == "i32" || peek_token().text == "i64")) {
-        next_token(); // consume the type keyword
-        if (peek_token().type == TokenType::Number) {
-            flag.behavior = static_cast<unsigned>(std::stoul(peek_token().text));
-            next_token(); // consume behavior number
-        }
+    // Note: the lexer classifies `i32`/`i64` as TokenType::Type (not
+    // Identifier), so we must accept either type here.
+    //
+    // IMPORTANT: a module flag's first element MUST be `i32 <number>` (or
+    // `i64 <number>`).  If we don't see that, this `!N = !{...}` is NOT a
+    // module flag — it's a plain metadata def (e.g. `!2 = !{!"clang..."}`).
+    // Rewind so parse_metadata_def() can capture it cleanly.
+    if (!((peek_token().type == TokenType::Identifier ||
+           peek_token().type == TokenType::Type) &&
+          (peek_token().text == "i32" || peek_token().text == "i64"))) {
+        pos_ = saved_pos;
+        return false;
+    }
+    next_token(); // consume the type keyword
+    if (peek_token().type == TokenType::Number) {
+        flag.behavior = static_cast<unsigned>(std::stoul(peek_token().text));
+        next_token(); // consume behavior number
+    } else {
+        // `i32` not followed by a number — also not a valid module flag.
+        pos_ = saved_pos;
+        return false;
     }
 
     // Comma
@@ -2407,19 +2483,21 @@ bool IRParser::try_parse_module_flag_entry(std::shared_ptr<ir::Module> mod) {
         if (tok.type == TokenType::Punctuation && tok.text == "{") brace_depth++;
         if (tok.type == TokenType::Punctuation && tok.text == "}") brace_depth--;
         if (brace_depth <= 0) break;
-        if (!value.empty() && tok.type != TokenType::Punctuation &&
-            !(tok.text == "," && value.empty())) {
-            // Add space before token if value is not empty and token isn't comma-at-start
-            // Only add space if last char isn't already a space
-            if (!value.empty() && value.back() != ' ' && value.back() != ',') {
-                value += ' ';
-            }
+        // Add a space separator before the token unless:
+        //   - value is empty
+        //   - last char is already a space or '{'
+        //   - the token is ',' (no space before commas)
+        if (!value.empty() && value.back() != ' ' && value.back() != '{' &&
+            tok.text != "," && tok.text != "}") {
+            value += ' ';
         }
         if (tok.type == TokenType::Punctuation && tok.text == "!") {
+            // `!N` or `!"string"` — append '!' and the following token
+            // WITHOUT a space, matching how LLVM IR is normally written.
             value += '!';
             next_token();
-            // The token after '!' could be a number, string, or identifier
             auto after = peek_token();
+            // Don't insert a space between '!' and its operand.
             value += after.text;
             next_token();
             continue;
@@ -2428,10 +2506,9 @@ bool IRParser::try_parse_module_flag_entry(std::shared_ptr<ir::Module> mod) {
         next_token();
     }
 
-    // Trim leading whitespace from value
+    // Trim leading/trailing whitespace from value
     while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
         value.erase(value.begin());
-    // Trim trailing whitespace from value
     while (!value.empty() && (value.back() == ' ' || value.back() == '\t'))
         value.pop_back();
 
@@ -2447,21 +2524,69 @@ bool IRParser::try_parse_module_flag_entry(std::shared_ptr<ir::Module> mod) {
         return true;
     }
 
-    // Not a valid module flag — we already consumed tokens, can't rewind easily.
-    // Return false so the caller knows, but the tokens are gone.
-    return found;
+    // We consumed `!N = [distinct] !{...}` but it wasn't a valid module
+    // flag (e.g. `!2 = !{!"clang version 18.0.0"}` — no i32 behavior
+    // prefix).  Don't drop it on the floor — store it as a generic
+    // numbered metadata def so it round-trips.  Reconstruct the body
+    // as `[distinct ]!{<value>}` with no leading/trailing space inside
+    // the braces when value is non-empty (matches clang's emission of
+    // `!{!"clang version 18.0.0"}` rather than `!{ !"clang version 18.0.0" }`).
+    std::string body = distinct_prefix;
+    body += '!';
+    body += '{';
+    if (!value.empty()) {
+        body += value;
+    }
+    body += '}';
+    mod->add_metadata_def(id, body);
+
+    // We DID consume the construct — return true so the dispatcher's
+    // follow-up parse_metadata_def() doesn't try to re-parse what's
+    // already gone.  (Returning true here is the "consumed but not a
+    // module flag" case described in the function header comment.)
+    return true;
 }
 
 // ── collect_function_attrs() ────────────────────────────────────────────────
 // Collect function attributes that appear after the parameter list closing ')'
-// and before the opening '{'.  Returns a vector of attribute strings that
-// can be re-emitted verbatim (e.g. "#0", "nounwind", "uwtable",
+// and before the opening '{' (for definitions) or the next top-level construct
+// (for declarations).  Returns a vector of attribute strings that can be
+// re-emitted verbatim (e.g. "#0", "nounwind", "uwtable",
 // "\"frame-pointer\"=\"all\"", etc.)
 std::vector<std::string> IRParser::collect_function_attrs() {
+    static const std::unordered_set<std::string> top_level_keywords = {
+        "define", "declare", "target", "attributes", "module", "source_filename"
+    };
     std::vector<std::string> attrs;
     while (peek_token().type != TokenType::Eof) {
         auto tok = peek_token();
+        // Stop at function-body open
         if (tok.type == TokenType::Punctuation && tok.text == "{") break;
+        // Stop at the next top-level construct (declaration case)
+        if (tok.type == TokenType::Keyword && top_level_keywords.count(tok.text)) break;
+        if (tok.type == TokenType::Punctuation && tok.text == "@") break;
+        if (tok.type == TokenType::Punctuation && tok.text == "%") {
+            // %name = type ...  → next named type definition
+            if (pos_ + 2 < tokens_.size() &&
+                tokens_[pos_ + 1].type == TokenType::Identifier &&
+                tokens_[pos_ + 2].type == TokenType::Punctuation &&
+                tokens_[pos_ + 2].text == "=") break;
+        }
+        // Distinguish metadata attachments (!dbg !N) from metadata
+        // definitions (!N = ... or !name = ...).  Attachments are consumed
+        // by skip_metadata() below; definitions cause us to stop so the
+        // outer parse_module loop can dispatch them.
+        if (tok.type == TokenType::Punctuation && tok.text == "!") {
+            // Lookahead: !<id-or-name> =
+            if (pos_ + 3 < tokens_.size() &&
+                (tokens_[pos_ + 1].type == TokenType::Number ||
+                 tokens_[pos_ + 1].type == TokenType::Identifier) &&
+                tokens_[pos_ + 2].type == TokenType::Punctuation &&
+                tokens_[pos_ + 2].text == "=") {
+                break;
+            }
+            // Bare attachment — fall through to skip_metadata() below.
+        }
 
         if (tok.type == TokenType::Punctuation && !tok.text.empty() && tok.text[0] == '#') {
             // Attribute group reference: #0, #1, etc.
@@ -2519,6 +2644,290 @@ std::vector<std::string> IRParser::collect_function_attrs() {
         }
     }
     return attrs;
+}
+
+// ── token_to_text() ────────────────────────────────────────────────────────
+// Render a token back to its textual form.  String tokens already include
+// their surrounding quotes (the lexer stores them that way), and the
+// `#N` attribute-group token is also stored complete, so for most tokens
+// `tok.text` is already the correct rendering.  This helper exists for
+// uniformity and future extension (e.g. escaping).
+std::string IRParser::token_to_text(const Token& tok) const {
+    return tok.text;
+}
+
+// ── parse_attribute_group() ────────────────────────────────────────────────
+//   attributes #N = { <body> }
+//
+// We capture <body> verbatim so the emitter can regenerate the line.  The
+// body typically contains keywords like `nounwind uwtable "frame-pointer"="all"`
+// plus parameter-attribute syntax that clunk's type system doesn't model
+// (e.g. `{ ptr nocapture noundef readonly }`).  Storing the raw text avoids
+// needing to understand every attribute form.
+void IRParser::parse_attribute_group(std::shared_ptr<ir::Module> mod) {
+    next_token(); // consume 'attributes'
+
+    // The next token is the attribute-group id: '#0', '#1', etc.
+    // The lexer already grouped '#N' into a single Punctuation token.
+    auto id_tok = next_token();
+    std::string id = id_tok.text;
+    if (id.empty() || id[0] != '#') {
+        // Malformed — bail out.  Try to recover by skipping to '}'.
+        while (peek_token().type != TokenType::Eof &&
+               !(peek_token().type == TokenType::Punctuation && peek_token().text == "}")) {
+            next_token();
+        }
+        if (peek_token().type == TokenType::Punctuation && peek_token().text == "}") {
+            next_token();
+        }
+        return;
+    }
+
+    if (!(peek_token().type == TokenType::Punctuation && peek_token().text == "=")) {
+        return;
+    }
+    next_token(); // consume '='
+
+    if (!(peek_token().type == TokenType::Punctuation && peek_token().text == "{")) {
+        return;
+    }
+    next_token(); // consume '{'
+
+    // Capture the body verbatim, with sensible spacing between tokens.
+    // We walk tokens until the matching '}', reconstructing text.
+    std::string body;
+    body.reserve(64);
+    int depth = 1;  // already inside one '{'
+
+    while (peek_token().type != TokenType::Eof && depth > 0) {
+        auto tok = peek_token();
+        if (tok.type == TokenType::Punctuation && tok.text == "{") {
+            ++depth;
+            body += " {";
+            next_token();
+            continue;
+        }
+        if (tok.type == TokenType::Punctuation && tok.text == "}") {
+            --depth;
+            next_token();
+            if (depth <= 0) break;
+            body += " }";
+            continue;
+        }
+        // Spacing rule: insert a separator space unless:
+        //   - body is empty (no leading space)
+        //   - last char is already a space or '{' (no double-space)
+        //   - last char is '!' (so `!N` and `!"..."` stay atomic — no `! N`)
+        //   - current token is ',' or '=' (no leading space before these)
+        //   - current token is a String following '=' (so `key="val"` not `key= "val"`)
+        if (!body.empty() && body.back() != ' ' && body.back() != '{' &&
+            body.back() != '!' &&
+            tok.text != "," && tok.text != "=" &&
+            !(tok.type == TokenType::String && body.back() == '=')) {
+            body += ' ';
+        }
+        body += token_to_text(tok);
+        next_token();
+    }
+
+    // Trim leading/trailing whitespace.
+    while (!body.empty() && (body.front() == ' ' || body.front() == '\t')) {
+        body.erase(body.begin());
+    }
+    while (!body.empty() && (body.back() == ' ' || body.back() == '\t')) {
+        body.pop_back();
+    }
+
+    mod->add_attribute_group(id, body);
+}
+
+// ── parse_named_metadata() ─────────────────────────────────────────────────
+//   !<name> = !{ ... }      (e.g. !llvm.ident = !{!0})
+//   !<name> = !N             (e.g. !dbg.cu = !0)
+//
+// We capture the RHS verbatim.  The name is stored without the leading '!'.
+// `!llvm.module.flags` is handled elsewhere (parse_llvm_module_flags) and
+// should not reach here — the dispatch in parse_module checks for it first.
+void IRParser::parse_named_metadata(std::shared_ptr<ir::Module> mod) {
+    next_token(); // consume '!'
+    auto name_tok = next_token();
+    std::string name = name_tok.text;
+
+    if (!(peek_token().type == TokenType::Punctuation && peek_token().text == "=")) {
+        return;
+    }
+    next_token(); // consume '='
+
+    // Capture the RHS verbatim.  This is typically `!{...}`, `!N`, or
+    // `!{!N, !M, ...}`.  We reconstruct from tokens until we hit something
+    // that looks like the start of the next top-level construct.
+    std::string body;
+    body.reserve(32);
+
+    // If the RHS starts with '!', consume the '!' first so the loop below
+    // is simpler.
+    bool starts_with_bang = (peek_token().type == TokenType::Punctuation &&
+                             peek_token().text == "!");
+    if (starts_with_bang) {
+        body += '!';
+        next_token();
+    }
+
+    // If after the '!' we have '{', walk to the matching '}'.
+    if (peek_token().type == TokenType::Punctuation && peek_token().text == "{") {
+        body += "{";
+        next_token();
+        int depth = 1;
+        while (peek_token().type != TokenType::Eof && depth > 0) {
+            auto tok = peek_token();
+            if (tok.type == TokenType::Punctuation && tok.text == "{") {
+                ++depth;
+                body += " {";
+                next_token();
+                continue;
+            }
+            if (tok.type == TokenType::Punctuation && tok.text == "}") {
+                --depth;
+                next_token();
+                if (depth <= 0) break;
+                body += " }";
+                continue;
+            }
+            if (!body.empty() && body.back() != ' ' && body.back() != '{' &&
+                body.back() != '!' &&
+                tok.text != "," && tok.text != "=") {
+                body += ' ';
+            }
+            body += token_to_text(tok);
+            next_token();
+        }
+        // Close the brace.  clang emits `!{!0}` / `!{!"..."}` / `!{!0, !1}`
+        // — NO leading space before `}`.  Just append `}`.
+        body += "}";
+    } else if (peek_token().type == TokenType::Number) {
+        // Simple form: `!name = !N`  (e.g. `!dbg.cu = !0`)
+        body += peek_token().text;
+        next_token();
+    } else if (peek_token().type == TokenType::Identifier) {
+        // `!name = !othername`  (rare, but legal)
+        body += peek_token().text;
+        next_token();
+    } else {
+        // Unknown RHS — let the dispatcher's fallback handle it.
+        return;
+    }
+
+    mod->add_named_metadata(name, body);
+}
+
+// ── parse_metadata_def() ───────────────────────────────────────────────────
+//   !N = !{ ... }            (regular metadata node)
+//   !N = distinct !{ ... }   (distinct metadata node)
+//   !N = !{!"string", ...}   (typical for !llvm.ident entries)
+//
+// try_parse_module_flag_entry() has already been attempted for `!N = !{ i32,
+// !"key", ... }` patterns and returned false, so we know this is NOT a
+// module-flag entry.  Capture it verbatim as a generic metadata def.
+void IRParser::parse_metadata_def(std::shared_ptr<ir::Module> mod) {
+    // Caller already verified: '!' Number '=' ...
+    next_token(); // consume '!'
+    auto id_tok = next_token(); // the number
+    std::string id = id_tok.text;
+
+    next_token(); // consume '='
+
+    std::string body;
+    body.reserve(64);
+
+    // Optional `distinct` keyword.
+    if (peek_token().type == TokenType::Identifier && peek_token().text == "distinct") {
+        body += "distinct ";
+        next_token();
+    }
+
+    // RHS starts with '!'
+    if (peek_token().type == TokenType::Punctuation && peek_token().text == "!") {
+        body += '!';
+        next_token();
+    } else {
+        // Unexpected — bail with what we have so far; the dispatcher's
+        // outer loop will pick up at the next token.
+        if (!body.empty()) {
+            mod->add_metadata_def(id, body);
+        }
+        return;
+    }
+
+    // Body forms: !{ ... }  or  !N  or  !"string"
+    if (peek_token().type == TokenType::Punctuation && peek_token().text == "{") {
+        body += "{";
+        next_token();
+        int depth = 1;
+        while (peek_token().type != TokenType::Eof && depth > 0) {
+            auto tok = peek_token();
+            if (tok.type == TokenType::Punctuation && tok.text == "{") {
+                ++depth;
+                body += " {";
+                next_token();
+                continue;
+            }
+            if (tok.type == TokenType::Punctuation && tok.text == "}") {
+                --depth;
+                next_token();
+                if (depth <= 0) break;
+                body += " }";
+                continue;
+            }
+            if (!body.empty() && body.back() != ' ' && body.back() != '{' &&
+                body.back() != '!' &&
+                tok.text != "," && tok.text != "=") {
+                body += ' ';
+            }
+            body += token_to_text(tok);
+            next_token();
+        }
+        // Close the brace.  clang emits `!{!0}` / `!{!"..."}` / `!{!0, !1}`
+        // — NO leading space before `}`.  Just append `}`.
+        body += "}";
+    } else if (peek_token().type == TokenType::Number) {
+        body += peek_token().text;
+        next_token();
+    } else if (peek_token().type == TokenType::String) {
+        body += peek_token().text;
+        next_token();
+    } else if (peek_token().type == TokenType::Identifier) {
+        body += peek_token().text;
+        next_token();
+    }
+
+    mod->add_metadata_def(id, body);
+}
+
+// ── parse_module_asm() ─────────────────────────────────────────────────────
+//   module asm "..."
+//   module asm "...\\n\\t..."
+//
+// We capture the string (with surrounding quotes) so the emitter can
+// regenerate the line.  Multiple `module asm` lines are stored in order.
+void IRParser::parse_module_asm(std::shared_ptr<ir::Module> mod) {
+    next_token(); // consume 'module'
+
+    if (!(peek_token().type == TokenType::Keyword && peek_token().text == "asm")) {
+        // `module ...` that isn't `module asm` — fall back to skipping.
+        while (peek_token().type != TokenType::Eof &&
+               peek_token().type != TokenType::Keyword &&
+               !(peek_token().type == TokenType::Punctuation && peek_token().text == "@")) {
+            next_token();
+        }
+        return;
+    }
+    next_token(); // consume 'asm'
+
+    // The string token includes its surrounding quotes.
+    if (peek_token().type == TokenType::String) {
+        mod->add_module_asm(peek_token().text);
+        next_token();
+    }
 }
 
 } // namespace clunk::parser

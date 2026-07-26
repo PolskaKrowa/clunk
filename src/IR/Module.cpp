@@ -20,6 +20,9 @@
  */
 #include "clunk/IR/Module.h"
 
+#include <algorithm>
+#include <vector>
+
 namespace clunk::ir {
 
 // ── Helper: linkage keyword for globals/declarations ────────────────────
@@ -100,6 +103,10 @@ std::string Module::to_string() const {
     // LLVM IR syntax:
     //   !0 = !{ i32 1, !"PIC Level", i32 2 }
     //   !llvm.module.flags = !{ !0, !1 }
+    //
+    // We emit the flag entries with a leading space inside the braces for
+    // readability, matching clang's output style.  The collection line uses
+    // `!{ !0, !1 }` (spaces between elements, no space before `}`).
     if (!module_flags_.empty()) {
         s.append("\n");
         for (size_t i = 0; i < module_flags_.size(); ++i) {
@@ -117,10 +124,66 @@ std::string Module::to_string() const {
         s.append("!llvm.module.flags = !{");
         for (size_t i = 0; i < module_flags_.size(); ++i) {
             if (i > 0) s.append(", ");
-            s.append(" !");
+            s.append("!");   // clang emits `!{!0, !1}` — no space after `{`
             s.append(std::to_string(i));
         }
-        s.append(" }\n");
+        s.append("}\n");
+    }
+
+    // ── Round-trip preservation: emit captured constructs verbatim ──────
+    //
+    // Order matters: LLVM IR requires named-metadata definitions to appear
+    // before metadata-id definitions can be referenced (well, actually it
+    // doesn't — forward references are legal — but emitting in source
+    // order matches what clang produces and is easiest to diff).  We emit:
+    //
+    //   1. module asm "..."        (top of file, after module flags)
+    //   2. attributes #N = { ... } (after module asm)
+    //   3. !name = !{...}          (named metadata, before numbered defs)
+    //   4. !N = !{...}             (numbered metadata defs, at end of file)
+    //
+    // Numbered metadata defs go at the very end because that's where clang
+    // emits them and many tools (including older versions of clunk's own
+    // parser) expect them there.
+
+    // 1. Module-level inline assembly
+    for (const auto& asm_line : module_asm_) {
+        s.append("module asm ");
+        s.append(asm_line);
+        s.append("\n");
+    }
+
+    // 2. Attribute groups (must appear before any function that references them)
+    // Emit in numeric-id order so output is stable across runs.
+    // We sort by parsing the numeric part of "#N" — IDs without a numeric
+    // suffix come first lexicographically.
+    {
+        std::vector<std::pair<std::string, std::string>> sorted_groups(
+            attribute_groups_.begin(), attribute_groups_.end());
+        std::sort(sorted_groups.begin(), sorted_groups.end(),
+            [](const std::pair<std::string, std::string>& a,
+               const std::pair<std::string, std::string>& b) {
+                // Extract the numeric part of "#N" for comparison.
+                auto numeric_part = [](const std::string& id) -> long {
+                    if (id.size() < 2 || id[0] != '#') return -1;
+                    try { return std::stol(id.substr(1)); }
+                    catch (...) { return -1; }
+                };
+                long na = numeric_part(a.first);
+                long nb = numeric_part(b.first);
+                if (na >= 0 && nb >= 0) return na < nb;
+                return a.first < b.first;
+            });
+        if (!sorted_groups.empty()) {
+            s.append("\n");
+        }
+        for (const auto& [id, body] : sorted_groups) {
+            s.append("attributes ");
+            s.append(id);
+            s.append(" = { ");
+            s.append(body);
+            s.append(" }\n");
+        }
     }
 
     // Named types
@@ -177,16 +240,68 @@ std::string Module::to_string() const {
             const auto& args = fn->arguments();
             for (size_t i = 0; i < args.size(); ++i) {
                 if (i > 0) s.append(", ");
+                // Emit parameter attributes that round-trip through the
+                // parser's collect_decl_param_attrs().  We emit them
+                // BEFORE the type, matching LLVM IR convention.
+                for (const auto& [k, v] : args[i].attrs) {
+                    if (k == "align") {
+                        s.append("align ");
+                        s.append(v);
+                        s.append(" ");
+                    } else {
+                        s.append(k);
+                        s.append(" ");
+                    }
+                }
                 s.append(args[i].type->to_string());
             }
             if (fn->function_type()->is_vararg()) {
                 if (!args.empty()) s.append(", ");
                 s.append("...");
             }
-            s.append(")\n\n");
+            s.append(")");
+            // Emit function attributes (e.g. ` #0` or ` nounwind`) so the
+            // declaration resolves its attribute-group references.
+            for (const auto& attr : fn->function_attributes()) {
+                s.append(" ");
+                s.append(attr);
+            }
+            s.append("\n\n");
         } else {
             // Definition with body
             s.append(fn->to_string());
+            s.append("\n");
+        }
+    }
+
+    // 3. Named metadata — emit BEFORE numbered metadata definitions so that
+    //    the named-metadata references (e.g. `!llvm.ident = !{!0}`) appear
+    //    before the `!0 = ...` definitions they point to.  This matches
+    //    clang's emission order and is what most .ll consumers expect.
+    if (!named_metadata_.empty()) {
+        s.append("\n");
+        for (const auto& [name, body] : named_metadata_) {
+            s.append("!");
+            s.append(name);
+            s.append(" = ");
+            s.append(body);
+            s.append("\n");
+        }
+    }
+
+    // 4. Numbered metadata definitions — emitted at the very end of the
+    //    module, matching clang's output convention.  Forward references
+    //    from named metadata (above) and from instructions (inside function
+    //    bodies) are resolved by LLVM's reader regardless of order, but
+    //    keeping these at the end produces output that diffs cleanly
+    //    against clang -S -emit-llvm.
+    if (!metadata_defs_.empty()) {
+        s.append("\n");
+        for (const auto& [id, body] : metadata_defs_) {
+            s.append("!");
+            s.append(id);
+            s.append(" = ");
+            s.append(body);
             s.append("\n");
         }
     }

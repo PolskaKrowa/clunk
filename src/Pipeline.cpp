@@ -135,9 +135,43 @@ PipelineResult Pipeline::run(const ir::Module& module) {
 
     // Create the optimised module (deep copy)
     result.optimised_module = std::make_shared<ir::Module>(module.name());
-    // Copy target info
+
+    // ── Round-trip preservation: copy every field the parser captured ──
+    //
+    // The pipeline creates a FRESH Module and copies functions/globals into
+    // it.  Without the copies below, every piece of metadata that clang
+    // needs to recompile the IR (source_filename, module flags, attribute
+    // groups, named metadata, numbered metadata defs, module asm) would be
+    // silently dropped, producing output that fails clang recompilation
+    // with errors like "attribute group #0 not found" or wrong PIC mode.
+    //
+    // Named types are also copied so that user-defined struct types
+    // (%struct.foo) round-trip even when no function in the module uses
+    // them directly (rare, but happens with debug info).
     if (module.has_target()) {
         result.optimised_module->set_target(module.target());
+    }
+    if (!module.source_filename().empty()) {
+        result.optimised_module->set_source_filename(module.source_filename());
+    }
+    for (const auto& mf : module.module_flags()) {
+        result.optimised_module->add_module_flag(mf);
+    }
+    for (const auto& [id, body] : module.attribute_groups()) {
+        result.optimised_module->add_attribute_group(id, body);
+    }
+    for (const auto& [name, body] : module.named_metadata()) {
+        result.optimised_module->add_named_metadata(name, body);
+    }
+    for (const auto& [id, body] : module.metadata_defs()) {
+        result.optimised_module->add_metadata_def(id, body);
+    }
+    for (const auto& asm_line : module.module_asm()) {
+        result.optimised_module->add_module_asm(asm_line);
+    }
+    // Named types — copy verbatim so %struct.foo definitions round-trip.
+    for (const auto& [name, ty] : module.named_types()) {
+        result.optimised_module->add_named_type(name, ty);
     }
 
     // Functions to process, in module order (independent — safe to optimise in

@@ -114,6 +114,19 @@ private:
     void parse_llvm_module_flags(std::shared_ptr<ir::Module> mod);
     bool try_parse_module_flag_entry(std::shared_ptr<ir::Module> mod);
 
+    // ── Round-trip preservation helpers ─────────────────────────────────
+    // These capture constructs the parser doesn't semantically model but
+    // must round-trip verbatim so clang can recompile the emitted IR.
+    void parse_attribute_group(std::shared_ptr<ir::Module> mod);          // `attributes #N = { ... }`
+    void parse_named_metadata(std::shared_ptr<ir::Module> mod);           // `!name = !{ ... }`
+    void parse_metadata_def(std::shared_ptr<ir::Module> mod);             // `!N = !{ ... }`
+    void parse_module_asm(std::shared_ptr<ir::Module> mod);               // `module asm "..."`
+
+    // Reconstruct the textual form of a token (handling quoted strings
+    // and punctuation) so we can store raw RHS bodies verbatim.  Returns
+    // the reconstructed text and consumes exactly one token from pos_.
+    std::string token_to_text(const Token& tok) const;
+
     // ── State ───────────────────────────────────────────────────────────
     std::vector<Token> tokens_;
     size_t pos_ = 0;
