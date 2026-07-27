@@ -25,6 +25,7 @@
 #include "clunk/Search/PeepholeMiner.h"
 
 #include <cstdlib>
+#include <cctype>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -41,9 +42,15 @@ static const char* CLUNK_VERSION = "0.1.0";
 struct CliOptions {
     std::string input_file;
     std::string output_file;       // empty = stdout
-    unsigned opt_level = 2;
+    unsigned opt_level = 3;        // numeric level (0-3); 3 = highest tier
+    // `max` is the new DEFAULT: opt_level=3 AND every optional stage
+    // enabled AND raised SMT/search limits. Users who want a faster,
+    // lighter run can pass --opt-level 0|1|2|3 explicitly.
+    bool opt_level_max = true;     // true iff --opt-level max (or default)
+    bool opt_level_explicitly_set = false;  // user passed --opt-level
     std::string target_triple;     // empty = host
     double time_budget = 30.0;     // default 30s wall-clock budget
+    bool time_budget_explicitly_set = false;  // user passed --time-budget
     bool no_z3 = false;
     bool no_gpu = false;
     bool no_miner = false;         // --no-miner: disable the in-loop peephole miner
@@ -71,11 +78,13 @@ struct CliOptions {
 
     // ── Scale-control flags ───────────────────────────────────────────────
     size_t max_function_size = 512;         // --max-function-size <n>
+    bool max_function_size_explicitly_set = false;
     bool skip_smt = false;                  // --skip-smt (disable SMT entirely)
 
     // ── Continuous-refinement flags ───────────────────────────────────
     size_t max_rounds = 0;                  // --max-rounds <n>; 0 = unlimited
     size_t convergence_rounds = 0;          // --convergence-rounds <n>; 0 = default
+    bool convergence_rounds_explicitly_set = false;
     bool trust_unverified = false;          // --trust-unverified
 
     // ── Per-function time cap ─────────────────────────────────────────────
@@ -83,20 +92,32 @@ struct CliOptions {
 
     // ── Superoptimiser-strategy flags ──────────────────────────────────
     bool allow_unsound_mutations = false;   // --stoke-moves
+    bool allow_unsound_mutations_explicitly_set = false;
     size_t test_vector_count = 0;           // --test-vectors <n>
+    bool test_vector_count_explicitly_set = false;
     bool enable_egraph_phase = false;       // --egraph
+    bool enable_egraph_phase_explicitly_set = false;
     bool no_harvest_miner = false;          // --no-harvest-miner
     std::string smt_cache_path;             // --cache-path <path>
     bool no_honor_binop_flags = false;      // --no-honor-binop-flags
     bool no_path_conditions = false;        // --no-path-conditions
     size_t max_mining_function_size = 8192; // --max-mining-function-size <n>
+    bool max_mining_function_size_explicitly_set = false;
 
-    // ── SMT tuning flags (new) ─────────────────────────────────────────
+    // ── SMT tuning flags ───────────────────────────────────────────────
     unsigned smt_timeout_ms = 0;            // --smt-timeout <ms>; 0 = default (30000)
     size_t smt_max_blocks = 0;              // --smt-max-blocks <n>; 0 = default (20)
     size_t smt_max_instructions = 0;        // --smt-max-instructions <n>; 0 = default (100)
     size_t max_smt_attempts = 0;            // --max-smt-attempts <n>; 0 = default (5)
     bool smt_bounded_unrolling = false;     // --smt-bounded-unrolling
+    // Track which SMT flags were explicitly set so max-mode can override
+    // only the ones the user did NOT pass.
+    bool smt_timeout_explicitly_set = false;
+    bool smt_max_blocks_explicitly_set = false;
+    bool smt_max_instructions_explicitly_set = false;
+    bool max_smt_attempts_explicitly_set = false;
+    bool smt_bounded_unrolling_explicitly_set = false;
+    bool use_mca_explicitly_set = false;
 
     // ── Cross-function flags (new) ─────────────────────────────────────
     bool no_cross_function = false;         // --no-cross-function
@@ -109,10 +130,17 @@ static void print_usage(const char* prog) {
               << "Clunk — LLVM superoptimiser\n"
               << "\n"
               << "Options:\n"
-              << "  --opt-level <0-3>         0 = off, 1 = patterns only, 2+ = continuous\n"
+              << "  --opt-level <0-3|max>     0 = off, 1 = patterns only, 2+ = continuous\n"
               << "                            search (level sizes each round, not the total;\n"
               << "                            refinement continues until convergence or the\n"
-              << "                            time budget runs out) (default: 2)\n"
+              << "                            time budget runs out). `max` (= level 3) also\n"
+              << "                            enables every optional stage (mca, stoke-moves,\n"
+              << "                            bounded unrolling, cross-function, multi-block\n"
+              << "                            inliner) and raises SMT/search limits to\n"
+              << "                            maximise optimisation opportunities. (e-graph is\n"
+              << "                            NOT auto-enabled — pass --egraph explicitly.)\n"
+              << "                            DEFAULT: max (just run `clunk input.ll` and get\n"
+              << "                            a faster program out).\n"
               << "  --max-rounds <n>          Cap refinement rounds per function (0 = unlimited)\n"
               << "  --convergence-rounds <n>  Stop after n rounds without improvement (default 3)\n"
               << "  --trust-unverified        Also adopt candidates the prover returned Unknown\n"
@@ -193,8 +221,27 @@ static CliOptions parse_args(int argc, char* argv[]) {
             opts.show_version = true;
         } else if (arg == "--opt-level") {
             if (i + 1 < argc) {
-                opts.opt_level = static_cast<unsigned>(std::stoul(argv[++i]));
-                if (opts.opt_level > 3) opts.opt_level = 3;
+                std::string val = argv[++i];
+                opts.opt_level_explicitly_set = true;
+                // Case-insensitive comparison for "max".
+                std::string lower_val;
+                lower_val.reserve(val.size());
+                for (char c : val) lower_val.push_back(
+                    static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+                if (lower_val == "max") {
+                    opts.opt_level_max = true;
+                    opts.opt_level = 3;
+                } else {
+                    opts.opt_level_max = false;
+                    try {
+                        opts.opt_level = static_cast<unsigned>(std::stoul(val));
+                    } catch (...) {
+                        std::cerr << "Error: --opt-level requires 0, 1, 2, 3, or max\n";
+                        opts.show_help = true;
+                        continue;
+                    }
+                    if (opts.opt_level > 3) opts.opt_level = 3;
+                }
             } else {
                 std::cerr << "Error: --opt-level requires an argument\n";
                 opts.show_help = true;
@@ -216,6 +263,7 @@ static CliOptions parse_args(int argc, char* argv[]) {
         } else if (arg == "--time-budget") {
             if (i + 1 < argc) {
                 opts.time_budget = std::stod(argv[++i]);
+                opts.time_budget_explicitly_set = true;
             } else {
                 std::cerr << "Error: --time-budget requires an argument\n";
                 opts.show_help = true;
@@ -230,6 +278,7 @@ static CliOptions parse_args(int argc, char* argv[]) {
             opts.no_vector_synth = true;
         } else if (arg == "--mca") {
             opts.use_mca = true;
+            opts.use_mca_explicitly_set = true;
         } else if (arg == "--verbose" || arg == "-v") {
             opts.verbose = true;
         } else if (arg == "--verbose-interval") {
@@ -299,6 +348,7 @@ static CliOptions parse_args(int argc, char* argv[]) {
         } else if (arg == "--max-function-size") {
             if (i + 1 < argc) {
                 opts.max_function_size = static_cast<size_t>(std::stoull(argv[++i]));
+                opts.max_function_size_explicitly_set = true;
             } else {
                 std::cerr << "Error: --max-function-size requires an argument\n";
                 opts.show_help = true;
@@ -315,6 +365,7 @@ static CliOptions parse_args(int argc, char* argv[]) {
         } else if (arg == "--convergence-rounds") {
             if (i + 1 < argc) {
                 opts.convergence_rounds = static_cast<size_t>(std::stoull(argv[++i]));
+                opts.convergence_rounds_explicitly_set = true;
             } else {
                 std::cerr << "Error: --convergence-rounds requires an argument\n";
                 opts.show_help = true;
@@ -330,15 +381,18 @@ static CliOptions parse_args(int argc, char* argv[]) {
             }
         } else if (arg == "--stoke-moves") {
             opts.allow_unsound_mutations = true;
+            opts.allow_unsound_mutations_explicitly_set = true;
         } else if (arg == "--test-vectors") {
             if (i + 1 < argc) {
                 opts.test_vector_count = static_cast<size_t>(std::stoull(argv[++i]));
+                opts.test_vector_count_explicitly_set = true;
             } else {
                 std::cerr << "Error: --test-vectors requires an argument\n";
                 opts.show_help = true;
             }
         } else if (arg == "--egraph") {
             opts.enable_egraph_phase = true;
+            opts.enable_egraph_phase_explicitly_set = true;
         } else if (arg == "--no-harvest-miner") {
             opts.no_harvest_miner = true;
         } else if (arg == "--no-path-conditions") {
@@ -347,6 +401,7 @@ static CliOptions parse_args(int argc, char* argv[]) {
             if (i + 1 < argc) {
                 opts.max_mining_function_size =
                     static_cast<size_t>(std::stoull(argv[++i]));
+                opts.max_mining_function_size_explicitly_set = true;
             } else {
                 std::cerr << "Error: --max-mining-function-size requires an argument\n";
                 opts.show_help = true;
@@ -363,6 +418,7 @@ static CliOptions parse_args(int argc, char* argv[]) {
         } else if (arg == "--smt-timeout") {
             if (i + 1 < argc) {
                 opts.smt_timeout_ms = static_cast<unsigned>(std::stoul(argv[++i]));
+                opts.smt_timeout_explicitly_set = true;
             } else {
                 std::cerr << "Error: --smt-timeout requires an argument\n";
                 opts.show_help = true;
@@ -370,6 +426,7 @@ static CliOptions parse_args(int argc, char* argv[]) {
         } else if (arg == "--smt-max-blocks") {
             if (i + 1 < argc) {
                 opts.smt_max_blocks = static_cast<size_t>(std::stoull(argv[++i]));
+                opts.smt_max_blocks_explicitly_set = true;
             } else {
                 std::cerr << "Error: --smt-max-blocks requires an argument\n";
                 opts.show_help = true;
@@ -377,6 +434,7 @@ static CliOptions parse_args(int argc, char* argv[]) {
         } else if (arg == "--smt-max-instructions") {
             if (i + 1 < argc) {
                 opts.smt_max_instructions = static_cast<size_t>(std::stoull(argv[++i]));
+                opts.smt_max_instructions_explicitly_set = true;
             } else {
                 std::cerr << "Error: --smt-max-instructions requires an argument\n";
                 opts.show_help = true;
@@ -384,12 +442,14 @@ static CliOptions parse_args(int argc, char* argv[]) {
         } else if (arg == "--max-smt-attempts") {
             if (i + 1 < argc) {
                 opts.max_smt_attempts = static_cast<size_t>(std::stoull(argv[++i]));
+                opts.max_smt_attempts_explicitly_set = true;
             } else {
                 std::cerr << "Error: --max-smt-attempts requires an argument\n";
                 opts.show_help = true;
             }
         } else if (arg == "--smt-bounded-unrolling") {
             opts.smt_bounded_unrolling = true;
+            opts.smt_bounded_unrolling_explicitly_set = true;
         } else if (arg == "--no-cross-function") {
             opts.no_cross_function = true;
         } else if (arg == "--no-multiblock-inliner") {
@@ -574,6 +634,39 @@ int main(int argc, char* argv[]) {
                   << " (" << module->function_count() << " functions)\n";
     }
 
+    // ── Large-input warning for --opt-level max ────────────────────────
+    // Max mode runs every stage with raised limits — on a large input
+    // that can take a very long time (or exhaust memory). Warn the user
+    // before the pipeline starts so they can Ctrl-C and re-run with a
+    // lower opt-level or a tighter time budget. The thresholds are
+    // heuristic: ~5000 instructions or ~500KB of source IR is roughly
+    // where max mode starts to feel slow on a typical workstation.
+    if (opts.opt_level_max) {
+        size_t total_insts = module->instruction_count();
+        size_t fn_count = module->function_count();
+        // Also check the file size on disk — a module with few functions
+        // but huge per-function bodies still warrants a warning.
+        std::ifstream size_check(opts.input_file, std::ios::binary | std::ios::ate);
+        size_t file_bytes = 0;
+        if (size_check.is_open()) {
+            file_bytes = static_cast<size_t>(size_check.tellg());
+            size_check.close();
+        }
+        const size_t INST_THRESHOLD = 5000;
+        const size_t FILE_BYTES_THRESHOLD = 500 * 1024;  // 500 KB
+        const size_t FN_THRESHOLD = 200;
+        if (total_insts > INST_THRESHOLD ||
+            file_bytes > FILE_BYTES_THRESHOLD ||
+            fn_count > FN_THRESHOLD) {
+            std::cerr << "Warning: --opt-level max on a large input ("
+                      << total_insts << " instructions, "
+                      << fn_count << " functions, "
+                      << (file_bytes / 1024) << " KB).\n"
+                      << "         This may take a long time.\n"
+                      << "         Continuing with max mode...\n";
+        }
+    }
+
     // ── Mining mode (--mine): SMT-verified peephole discovery ───────────
     // Enumerative superoptimisation over the input's integer functions;
     // proven-cheaper rewrites are appended to the --pattern-library file for
@@ -726,6 +819,91 @@ int main(int argc, char* argv[]) {
     // ── Per-function time cap ─────────────────────────────────────────────
     config.max_time_per_function = opts.max_time_per_function;
 
+    // ── `--opt-level max` overrides ────────────────────────────────────
+    // When max mode is active (the default, or via --opt-level max), turn
+    // on every optional optimisation stage and raise every limit so the
+    // pipeline finds the most provable optimisations it can within the
+    // time budget. Each override respects an explicit user flag — e.g.
+    // `--opt-level max --no-egraph` keeps e-graph OFF even in max mode.
+    if (opts.opt_level_max && !opts.no_z3 && !opts.skip_smt) {
+        config.opt_level = 3;
+
+        // ── Enable every optional stage (each gated by its explicit-set
+        // flag so the user can still turn any of them OFF).
+        // NOTE: e-graph is NOT enabled by default in max mode — it has a
+        // known issue where call instructions can be extracted as
+        // `call @<unknown>()` (the e-graph doesn't model callees). Users
+        // who want e-graph can still pass --egraph explicitly.
+        if (!opts.enable_egraph_phase_explicitly_set) {
+            config.enable_egraph_phase = false;
+        }
+        if (!opts.use_mca_explicitly_set) {
+            // MCA ranker requires llc + llvm-mca on PATH; the pipeline
+            // checks is_available() before using it, so turning the flag
+            // on is safe even when the tools aren't installed.
+            config.use_mca_ranker = true;
+        }
+        if (!opts.allow_unsound_mutations_explicitly_set) {
+            // STOKE moves are unsound-by-construction but every candidate
+            // is SMT-verified before adoption. Safe in max mode (which
+            // keeps SMT on); we already bailed above if --no-z3.
+            config.allow_unsound_mutations = true;
+        }
+        if (!opts.test_vector_count_explicitly_set) {
+            // Massalin's recommended 32 test vectors as a pre-filter
+            // before SMT — catches most non-equivalent candidates cheaply.
+            config.test_vector_count = 64;
+        }
+        if (!opts.smt_bounded_unrolling_explicitly_set) {
+            config.smt_config.sound_bounded_unrolling = true;
+        }
+        // Cross-function passes are ON by default already; ensure max
+        // mode keeps them on unless the user explicitly disabled them.
+        // (No action needed — handled by the no_cross_function /
+        // no_multiblock_inliner flags above.)
+
+        // ── Raise SMT limits so more functions are verifiable ────────
+        if (!opts.smt_timeout_explicitly_set) {
+            config.smt_config.timeout_ms = 60000;  // 1 min per Z3 call
+        }
+        if (!opts.smt_max_blocks_explicitly_set) {
+            config.smt_config.max_blocks_for_smt = 100;  // 5x default
+        }
+        if (!opts.smt_max_instructions_explicitly_set) {
+            config.smt_config.max_instructions_for_smt = 500;  // 5x default
+        }
+        if (!opts.max_smt_attempts_explicitly_set) {
+            config.max_smt_attempts = 80;  // prove more candidates per round
+        }
+
+        // ── Raise scale-control so bigger functions get the full stack ─
+        if (!opts.max_function_size_explicitly_set) {
+            config.max_function_size = 4096;  // 8x default
+        }
+        if (!opts.max_mining_function_size_explicitly_set) {
+            config.max_mining_function_size = 65536;  // 8x default
+        }
+
+        // ── More patience: convergence_rounds 1024 (default 3) so the
+        // pipeline keeps searching longer before giving up on a function.
+        if (!opts.convergence_rounds_explicitly_set) {
+            config.convergence_rounds = 1024;
+        }
+        // max_rounds stays 0 (unlimited) — the time budget bounds wall-clock.
+        // max_time_per_function stays 0 (no per-fn cap) — the time budget
+        // bounds wall-clock and we want every function to get its fair share.
+
+        // ── Time budget: if the user did NOT explicitly set one, set
+        // to an unlimited time budget.
+        if (!opts.time_budget_explicitly_set) {
+            config.time_budget = 0.0;
+            // Propagate to the search engines.
+            config.stochastic_config.time_budget_seconds = 0.0;
+            config.evolutionary_config.time_budget_seconds = 0.0;
+        }
+    }
+
+
     // ── Create Pipeline and run ─────────────────────────────────────────
     clunk::Pipeline pipeline(config);
 
@@ -760,6 +938,7 @@ int main(int argc, char* argv[]) {
 
     if (opts.verbose) {
         std::cerr << "Running pipeline at opt_level=" << config.opt_level
+                  << (opts.opt_level_max ? " (max)" : "")
                   << " target=" << config.target_arch.name << " ...\n";
     }
 

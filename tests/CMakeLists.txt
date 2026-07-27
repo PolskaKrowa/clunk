@@ -29,6 +29,7 @@ set(TEST_SOURCES
     test_strength_reduce
     test_cross_function
     test_smt_bounded_unrolling
+    test_opt_level_max
 )
 
 if(CLUNK_ENABLE_GPU)
