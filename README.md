@@ -34,6 +34,8 @@
 </svg>
 <br>
 <i>With a good set of tools, even anvils can move fast.</i>
+<br>
+<br>
 </div>
 
 **Clunk** is an LLVM IR superoptimiser. It takes LLVM IR (`.ll` files) and
