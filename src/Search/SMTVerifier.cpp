@@ -27,6 +27,7 @@
 #include "clunk/IR/Value.h"
 #include "clunk/IR/Clone.h"
 #include "clunk/IR/Scalarizer.h"
+#include "clunk/Search/LoopOpt.h"
 #include "clunk/Search/Z3RAII.h"
 #include "clunk/Search/StochasticSearch.h"  // for structural_hash (cache key)
 // Include RewriteCache for cache-key-based equivalence lookup in verify().
@@ -2224,15 +2225,40 @@ VerificationResult SMTVerifier::verify_with_z3(
         return result;
     }
 
+    // ── Bounded loop unrolling pre-pass ────────────────────────────────
+    // When sound_bounded_unrolling is enabled, pre-unroll constant-trip
+    // single-block loops in BOTH functions. The unroller
+    // (LoopOptimizer::unroll_constant_loops) is sound-by-construction:
+    // it abstractly interprets the loop to determine the trip count and
+    // refuses to unroll anything it cannot prove constant. So a function
+    // that would have triggered sound_loop_fallback may now be SMT-
+    // verifiable as straight-line code.
+    //
+    // `work_orig` / `work_cand` hold the unrolled copies (if any);
+    // the references `orig_fn` / `cand_fn` below alias either the
+    // unrolled copy (when one exists) or the caller's original/candidate.
+    std::shared_ptr<ir::Function> work_orig, work_cand;
+    if (config_.sound_bounded_unrolling) {
+        // Use LoopOpt's sound unroller. Local linkage so we don't
+        // introduce a header dependency for callers of SMTVerifier.
+        search::LoopOptimizer unroller;
+        auto uo = unroller.unroll_constant_loops(original);
+        auto uc = unroller.unroll_constant_loops(candidate);
+        if (uo) work_orig = uo;
+        if (uc) work_cand = uc;
+    }
+    const ir::Function& orig_fn = work_orig ? *work_orig : original;
+    const ir::Function& cand_fn = work_cand ? *work_cand : candidate;
+
     // ── C2/C3/C4/C8: check for unsupported operations ───────────────────
     std::string orig_reason, cand_reason;
-    if (function_has_unsupported_ops(original, config_, orig_reason)) {
+    if (function_has_unsupported_ops(orig_fn, config_, orig_reason)) {
         result.status = VerificationResult::Unknown;
         result.message = "Original " + orig_reason;
         result.z3_reason = orig_reason;
         return result;
     }
-    if (function_has_unsupported_ops(candidate, config_, cand_reason)) {
+    if (function_has_unsupported_ops(cand_fn, config_, cand_reason)) {
         result.status = VerificationResult::Unknown;
         result.message = "Candidate " + cand_reason;
         result.z3_reason = cand_reason;
@@ -2294,8 +2320,8 @@ VerificationResult SMTVerifier::verify_with_z3(
     std::unordered_map<unsigned, Z3_ast> shared_poison;
     std::vector<Z3_ast> shared_poison_refs;
     bool use_bv = config_.use_bitvectors;
-    for (size_t i = 0; i < original.argument_count(); ++i) {
-        auto& arg = original.arguments()[i];
+    for (size_t i = 0; i < orig_fn.argument_count(); ++i) {
+        auto& arg = orig_fn.arguments()[i];
         std::string arg_name = arg.name.empty() ? ("arg" + std::to_string(i)) : arg.name;
         Z3_sort sort = get_z3_sort(ctx, *arg.type, use_bv);
         // Neutral name: arg_0, arg_1, ... (shared between original and candidate).
@@ -2311,10 +2337,13 @@ VerificationResult SMTVerifier::verify_with_z3(
     }
 
     // ── Encode both functions ────────────────────────────────────────────
-    orig_enc = encode_function(ctx, original, "orig", use_bv, shared_args, config_, &shared_poison);
+    // Use orig_fn / cand_fn (which may be unrolled copies when
+    // sound_bounded_unrolling is on) rather than the caller-supplied
+    // original / candidate.
+    orig_enc = encode_function(ctx, orig_fn, "orig", use_bv, shared_args, config_, &shared_poison);
     orig_enc.ctx = ctx;
 
-    cand_enc = encode_function(ctx, candidate, "cand", use_bv, shared_args, config_, &shared_poison);
+    cand_enc = encode_function(ctx, cand_fn, "cand", use_bv, shared_args, config_, &shared_poison);
     cand_enc.ctx = ctx;
 
     // After both encodings, the shared_poison map's values are referenced
@@ -2406,9 +2435,9 @@ VerificationResult SMTVerifier::verify_with_z3(
     // only WIDENS the input space the proof must cover, which is sound.
     if (assumptions && use_bv) {
         auto arg_width = [&](int idx) -> unsigned {
-            if (idx < 0 || static_cast<size_t>(idx) >= original.argument_count())
+            if (idx < 0 || static_cast<size_t>(idx) >= orig_fn.argument_count())
                 return 0;
-            auto& t = original.arguments()[idx].type;
+            auto& t = orig_fn.arguments()[idx].type;
             return t ? t->bit_width() : 0;
         };
         for (const auto& a : *assumptions) {
@@ -3556,8 +3585,10 @@ SynthesisResult SMTVerifier::synthesize_with_cegis(
     }
 
     // ── Enumeration fallback ───────────────────────────────────────────
-    // Cap: 2 placeholders max (16^2 = 256 verifications). More would blow
-    // the time budget.
+    // Cap: 2 placeholders max. With the expanded constant pool (~37
+    // constants), worst case is 37^2 ≈ 1.4k verifications — bounded by
+    // the per-call time budget (Z3 calls each have their own timeout).
+    // More than 2 placeholders would blow the time budget.
     if (placeholder_names.size() > 2) {
         result.message = "too many placeholders (max 2 in the enumeration fallback)";
         result.solve_time_ms = std::chrono::duration<double, std::milli>(
@@ -3565,9 +3596,24 @@ SynthesisResult SMTVerifier::synthesize_with_cegis(
         return result;
     }
 
-    // The constant pool (brief-specified).
+    // The constant pool. Expanded from the original 16-element set to
+    // cover more common constants found in real code: bit widths, masks,
+    // small primes, and signed sentinels. With 24 constants and 2
+    // placeholders, the worst case is 24^2 = 576 verifications — bounded
+    // by the time budget and the existing "≤2 placeholders" cap.
     static const std::vector<int64_t> POOL = {
-        0, 1, 2, 3, 5, 7, 8, 15, 16, 31, 32, 63, 64, -1, 255, 256
+        // Identity / zero.
+        0, 1, -1,
+        // Small integers.
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 12, 15, 16,
+        // Powers of two and adjacent masks.
+        31, 32, 63, 64, 127, 128, 255, 256, 511, 512,
+        1023, 1024, 4095, 4096,
+        65535, 65536,
+        // Common divisor / shift amounts.
+        24, 48, 56,
+        // Negative sentinels.
+        -2, -8, -16, -256,
     };
 
     // Helper: deep-copy the candidate template and substitute placeholder

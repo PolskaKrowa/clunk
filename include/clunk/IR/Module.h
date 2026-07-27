@@ -69,6 +69,23 @@ public:
         functions_.push_back(fn);
     }
 
+    // Remove a function by name. Returns true iff it was present (and
+    // removed). Rebuilds the name->index map. Does NOT fix up call
+    // sites elsewhere that reference this name — callers are responsible
+    // for ensuring no dangling references (e.g. via DeadFunctionElimination
+    // only removing functions whose callers are themselves dead).
+    bool remove_function(const std::string& name) {
+        auto it = fn_index_.find(name);
+        if (it == fn_index_.end()) return false;
+        size_t idx = it->second;
+        functions_.erase(functions_.begin() + static_cast<ptrdiff_t>(idx));
+        fn_index_.erase(it);
+        for (auto& [k, v] : fn_index_) {
+            if (v > idx) --v;
+        }
+        return true;
+    }
+
     std::shared_ptr<Function> function(const std::string& name) const {
         auto it = fn_index_.find(name);
         if (it == fn_index_.end()) return nullptr;
@@ -76,6 +93,7 @@ public:
     }
 
     const std::vector<std::shared_ptr<Function>>& functions() const { return functions_; }
+    std::vector<std::shared_ptr<Function>>& functions() { return functions_; }
 
     // Globals
     void add_global(GlobalValue gv) {

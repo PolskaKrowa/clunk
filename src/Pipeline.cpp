@@ -31,9 +31,12 @@
 #include <unordered_set>
 
 #include "clunk/Evaluator/CostModel.h"
+#include "clunk/IR/Clone.h"
 #include "clunk/IR/DataflowPrune.h"
 #include "clunk/IR/LoopAnalysis.h"
 #include "clunk/IR/Scalarizer.h"
+#include "clunk/Analysis/CallGraph.h"
+#include "clunk/Search/CrossFunctionPasses.h"
 #include "clunk/Search/Inliner.h"
 #include "clunk/Search/LoopOpt.h"
 #include "clunk/Search/MemOpt.h"
@@ -139,12 +142,97 @@ PipelineResult Pipeline::run(const ir::Module& module) {
     if (module.has_target()) {
         result.optimised_module->set_target(module.target());
     }
+    // Copy round-trip-preservation fields (attribute groups, named metadata,
+    // metadata defs, module asm, named types, source filename, module flags).
+    // Without this, emitting the optimised module drops these — and clang
+    // won't recompile the result.
+    result.optimised_module->set_source_filename(module.source_filename());
+    for (auto& mf : module.module_flags()) result.optimised_module->add_module_flag(mf);
+    for (auto& [id, body] : module.attribute_groups()) {
+        result.optimised_module->add_attribute_group(id, body);
+    }
+    for (auto& [name, body] : module.named_metadata()) {
+        result.optimised_module->add_named_metadata(name, body);
+    }
+    for (auto& [id, body] : module.metadata_defs()) {
+        result.optimised_module->add_metadata_def(id, body);
+    }
+    for (auto& asm_line : module.module_asm()) {
+        result.optimised_module->add_module_asm(asm_line);
+    }
+    for (auto& [name, ty] : module.named_types()) {
+        result.optimised_module->add_named_type(name, ty);
+    }
+
+    // ── Module-level pre-pass: cross-function optimisations ────────────
+    // Run BEFORE per-function optimisation. The pre-pass operates on a
+    // deep copy of the module so the user's input is untouched. The
+    // passes are:
+    //   1. Dead Function Elimination — remove module-internal functions
+    //      no caller can reach. Frees the per-function pipeline from
+    //      wasting rounds on dead code.
+    //   2. Interprocedural Constant Propagation — clone a function for
+    //      every constant value its callers uniformly pass to a given
+    //      argument position, then rewrite callers to the clone. The
+    //      clone is then a constant-folding target for the per-function
+    //      pipeline. After IPCP, the original function might be dead
+    //      (if ALL callers were rewritten); DFE runs again to clean up.
+    //
+    // Both passes are exact by construction (no SMT needed).
+    //
+    // Build the work_module as a DEEP copy: a fresh Module with deep-copied
+    // Function objects. (Module's default copy constructor is shallow —
+    // functions_ holds shared_ptrs, so a shallow copy would share Function
+    // objects with the input module and our mutations would leak back.)
+    auto work_module = std::make_shared<ir::Module>(module.name());
+    if (module.has_target()) work_module->set_target(module.target());
+    work_module->set_source_filename(module.source_filename());
+    for (auto& mf : module.module_flags()) work_module->add_module_flag(mf);
+    for (auto& [id, body] : module.attribute_groups()) {
+        work_module->add_attribute_group(id, body);
+    }
+    for (auto& [name, body] : module.named_metadata()) {
+        work_module->add_named_metadata(name, body);
+    }
+    for (auto& [id, body] : module.metadata_defs()) {
+        work_module->add_metadata_def(id, body);
+    }
+    for (auto& asm_line : module.module_asm()) {
+        work_module->add_module_asm(asm_line);
+    }
+    for (auto& [name, ty] : module.named_types()) {
+        work_module->add_named_type(name, ty);
+    }
+    for (auto& fn : module.functions()) {
+        if (!fn) continue;
+        work_module->add_function(ir::deep_copy_function(*fn));
+    }
+    for (auto& gv : module.globals()) {
+        work_module->add_global(gv);
+    }
+
+    if (config_.enable_cross_function && config_.opt_level >= 2) {
+        search::CrossFnConfig xcfg;
+        xcfg.enable_dfe = true;
+        xcfg.enable_ipcp = true;
+        search::CrossFunctionPasses xpass(xcfg);
+        bool xchanged = xpass.run(*work_module);
+        if (xchanged && config_.verbose) {
+            const auto& st = xpass.stats();
+            std::cerr << "  [xpass] DFE removed " << st.dfe_removed
+                      << " function(s); IPCP created " << st.ipcp_cloned
+                      << " clone(s), rewrote " << st.ipcp_callers_rewritten
+                      << " caller(s)\n";
+        }
+    }
 
     // Functions to process, in module order (independent — safe to optimise in
     // parallel). Results are indexed by position so the output module keeps
     // module order regardless of completion order.
+    // NOTE: we iterate the work_module (post-cross-function-passes), NOT
+    // the original `module` — IPCP/DFE may have added/removed functions.
     std::vector<const ir::Function*> fns;
-    for (auto& fn : module.functions())
+    for (auto& fn : work_module->functions())
         if (fn) fns.push_back(fn.get());
     const size_t total_fns = fns.size();
     std::vector<PipelineResult::FunctionResult> fn_results(total_fns);
@@ -167,15 +255,21 @@ PipelineResult Pipeline::run(const ir::Module& module) {
             return;
         }
 
-        // ── Interprocedural pre-pass: inline small single-block callees.
-        // Exact by construction and cost-gated. Beyond the direct win, it
-        // removes opaque calls — the refinement chain then anchors SMT
-        // verification on the inlined body, which (unlike the original)
-        // the prover can actually model.
+        // ── Interprocedural pre-pass: inline small callees.
+        // Two tiers:
+        //   1. Single-block inliner (legacy): inlines trivial wrappers
+        //      and constant folders — exact by construction and
+        //      cost-gated. Removes opaque calls so SMT can verify the
+        //      caller.
+        //   2. Multi-block inliner (opt-in via enable_multiblock_inliner):
+        //      handles multi-block callees, allocas, and recursive call
+        //      graphs (with SCC + depth guards). Same cost-gating.
+        // Both tiers consult the work_module (post-cross-function-passes)
+        // for callee bodies — IPCP/DFE may have changed what's available.
         std::shared_ptr<ir::Function> inlined;
         if (config_.enable_inliner && config_.opt_level >= 1) {
             search::Inliner inliner;
-            inlined = inliner.inline_calls(fn, module);
+            inlined = inliner.inline_calls(fn, *work_module);
             if (inlined &&
                 !(eval_engine_.score_candidate(fn, *inlined) > 1.0)) {
                 inlined = nullptr;  // not a win — keep the original
@@ -184,6 +278,32 @@ PipelineResult Pipeline::run(const ir::Module& module) {
                 std::cerr << "  [inline] " << fn.name() << ": inlined "
                           << inliner.stats().call_sites_inlined
                           << " call site(s)\n";
+            }
+        }
+
+        // ── Multi-block inliner (cross-function extension) ──────────
+        // Runs after the single-block inliner, so it sees callees the
+        // single-block path couldn't handle. Cost-gated like above.
+        if (config_.enable_multiblock_inliner && config_.opt_level >= 2 &&
+            remaining_seconds() > 0.05) {
+            const ir::Function& mb_base = inlined ? *inlined : fn;
+            search::InlinerConfig mcfg;
+            mcfg.enable_multiblock = true;
+            search::Inliner mbinliner(mcfg);
+            auto mb_inlined = mbinliner.inline_calls_multiblock(
+                mb_base, *work_module);
+            if (mb_inlined &&
+                !(eval_engine_.score_candidate(mb_base, *mb_inlined) > 1.0)) {
+                mb_inlined = nullptr;
+            }
+            if (mb_inlined) {
+                if (config_.verbose) {
+                    std::cerr << "  [inline-mb] " << fn.name()
+                              << ": inlined "
+                              << mbinliner.stats().multiblock_inlined
+                              << " multi-block call site(s)\n";
+                }
+                inlined = mb_inlined;
             }
         }
 
@@ -1281,7 +1401,10 @@ std::shared_ptr<ir::Function> Pipeline::verify_and_select(
 
     std::shared_ptr<ir::Function> unknown_fallback;
     size_t smt_attempts = 0;
-    constexpr size_t MAX_SMT_ATTEMPTS = 5;
+    // Per-round SMT attempt cap. The historical hard-coded 5 is the
+    // default; --max-smt-attempts overrides it. 0 falls back to 5.
+    const size_t MAX_SMT_ATTEMPTS =
+        config_.max_smt_attempts > 0 ? config_.max_smt_attempts : 5;
     for (auto& sc : scored) {
         if (sc.candidate->sound) {
             result.verified = true;

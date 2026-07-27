@@ -26,48 +26,85 @@
  * the caller becomes cheaper AND verifiable, so every downstream phase
  * (miner, CEGIS, e-graph) can suddenly reason about the combined body.
  *
- * Scope (deliberately conservative — inlining must be exact by
- * construction, since the pre-inlining caller cannot be SMT-verified):
- *   - callee is defined in the same module, is not the caller itself,
- *     and has exactly ONE basic block ending in `ret`;
- *   - no calls, invokes, phis, or allocas inside the callee (allocas
- *     would change per-iteration allocation behaviour when the call
- *     site sits in a loop; nested calls would need a call graph);
- *   - not vararg; argument count matches the call's operand count.
+ * TWO inlining modes:
  *
- * Callee instructions are cloned with fresh SSA names, argument
- * references substitute to the call operands, and the `ret` value
- * substitutes for the call result everywhere in the caller. Memory
- * operations in the callee are fine — the clone preserves their exact
- * order and count at the call site.
+ *  1. `inline_calls()` — backward-compatible single-block inliner
+ *     (the original). Conservative eligibility: callee has exactly one
+ *     basic block ending in `ret`, no calls/invokes/phis/allocas inside.
+ *     Used as the per-function pre-pass before run_on_function().
+ *
+ *  2. `inline_calls_multiblock()` — the cross-function extension. Uses
+ *     a module-level CallGraph to walk the call graph bottom-up and
+ *     inline multi-block callees into their callers. Handles:
+ *       - Multi-block callees (CFG cloned verbatim, all blocks renamed).
+ *       - Phi nodes at the callee's entry (rewired to caller-side values
+ *         via the predecessor-edge mapping).
+ *       - Alloca instructions in the callee (hoisted to the caller's
+ *         entry block — preserves per-call-stack-frame semantics).
+ *       - Recursive call graphs: refuses to inline a callee into itself
+ *         (call-graph SCC check), and applies a depth cap on the
+ *         transitive inlining chain to avoid exponential blow-up.
+ *
+ * The multi-block inliner is gated by `enable_multiblock` (default true
+ * at opt_level >= 2) and `max_caller_instructions_after` (default 256 —
+ * refuse to grow a caller past this size).
  */
 #include <cstddef>
 #include <memory>
+#include <string>
+#include <unordered_set>
+#include <vector>
 
 #include "clunk/IR/Function.h"
 #include "clunk/IR/Module.h"
 
+namespace clunk::analysis { class CallGraph; }
+
 namespace clunk::search {
 
 struct InlinerConfig {
-    size_t max_callee_instructions = 32;  // excluding the ret
-    size_t max_inlines_per_function = 8;
+    size_t max_callee_instructions = 32;        // single-block mode (excl. ret)
+    size_t max_inlines_per_function = 8;        // both modes
+    // ── Multi-block inliner controls ──────────────────────────────────
+    size_t max_multiblock_callee_instructions = 64;  // body size cap
+    size_t max_multiblock_callee_blocks = 16;        // CFG size cap
+    size_t max_caller_instructions_after = 256;      // refuse to grow past this
+    size_t max_inline_depth = 4;                     // transitive inlining depth
+    bool enable_multiblock = true;
 };
 
 class Inliner {
 public:
     explicit Inliner(const InlinerConfig& config = {});
 
-    // Inline eligible call sites of `fn` using bodies from `mod`.
-    // Returns the rewritten function, or nullptr if nothing was inlined.
+    // Single-block inlining (legacy). Returns the rewritten function or
+    // nullptr if nothing was inlined.
     std::shared_ptr<ir::Function> inline_calls(const ir::Function& fn,
                                                const ir::Module& mod);
+
+    // ── Multi-block, call-graph-aware inlining ───────────────────────
+    // Returns a new function with eligible multi-block callees inlined
+    // at their call sites, or nullptr if nothing changed. The optional
+    // `cg` parameter is a pre-built call graph; if null, one is built
+    // internally. `visited` is the recursion-guard set (callers pass an
+    // empty set; the inliner adds callee names as it descends).
+    std::shared_ptr<ir::Function> inline_calls_multiblock(
+        const ir::Function& fn,
+        const ir::Module& mod,
+        const analysis::CallGraph* cg = nullptr,
+        std::unordered_set<std::string> visited = {});
 
     struct Stats {
         size_t call_sites_seen = 0;
         size_t call_sites_inlined = 0;
+        size_t multiblock_inlined = 0;
+        size_t recursion_refused = 0;
+        size_t size_refused = 0;
     };
     const Stats& stats() const { return stats_; }
+
+    // Reset per-Inliner stats (useful between functions).
+    void reset_stats() { stats_ = Stats{}; }
 
 private:
     InlinerConfig config_;

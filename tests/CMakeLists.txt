@@ -27,6 +27,8 @@ set(TEST_SOURCES
     test_dataflow_prune
     test_powers_of_two
     test_strength_reduce
+    test_cross_function
+    test_smt_bounded_unrolling
 )
 
 if(CLUNK_ENABLE_GPU)

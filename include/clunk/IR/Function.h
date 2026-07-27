@@ -108,6 +108,18 @@ public:
     // Build predecessor info for all blocks
     void compute_predecessors();
 
+    // ── Rebuild block index ───────────────────────────────────────────
+    // Reconstructs the name->index map from the current blocks_ vector.
+    // Call this after directly mutating blocks_ (e.g. inserting blocks
+    // out-of-order). add_block() maintains the index automatically, so
+    // this is only needed when callers bypass add_block().
+    void rebuild_block_index() {
+        block_index_.clear();
+        for (size_t i = 0; i < blocks_.size(); ++i) {
+            if (blocks_[i]) block_index_[blocks_[i]->name()] = i;
+        }
+    }
+
     // Check if this is a GPU kernel
     bool is_gpu_kernel() const {
         return attrs_.count("kernel") || attrs_.count("nvptx-kernel");

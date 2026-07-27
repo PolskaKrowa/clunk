@@ -189,6 +189,26 @@ struct PipelineConfig {
     // inlined body cheaper. Default ON.
     bool enable_inliner = true;
 
+    // ── Cross-function optimisation (module-level passes) ───────────────
+    // Run before per-function superoptimisation. Two passes:
+    //  - Dead Function Elimination (DFE): remove module-internal
+    //    functions that no caller can reach. Frees the per-function
+    //    pipeline from wasting rounds on dead code.
+    //  - Interprocedural Constant Propagation (IPCP): for every function
+    //    argument where ALL direct callers pass the SAME constant,
+    //    clone the function with the constant substituted and rewrite
+    //    callers to invoke the clone. The clone is then a target for
+    //    constant folding by the per-function pipeline.
+    // Both passes are exact by construction (no SMT needed). Default ON
+    // at opt_level >= 2.
+    bool enable_cross_function = true;
+    // ── Multi-block inliner ─────────────────────────────────────────────
+    // Extends the inliner beyond single-block callees: handles multi-block
+    // callees (CFG cloned verbatim), allocas (hoisted to caller entry),
+    // and recursive call graphs (refuses to inline a callee into itself
+    // via SCC check; transitive depth cap). Default ON at opt_level >= 2.
+    bool enable_multiblock_inliner = true;
+
     // ── Vector-intrinsic synthesis (Minotaur-style) ──────────────────────
     // When true, run_on_function runs a vector_phase() each round on
     // functions containing vector operations: it recognises scalar idioms
@@ -284,6 +304,14 @@ struct PipelineConfig {
     // Useful for very large inputs where SMT would never terminate.
     // Tunable via --skip-smt.
     bool skip_smt = false;
+
+    // ── SMT-attempt cap ─────────────────────────────────────────────────
+    // Per-round cap on the number of SMT verify() calls verify_and_select
+    // makes before giving up on the candidate batch. The historical hard-
+    // coded default was 5; raising it lets more candidates get proven at
+    // the cost of more wall-clock time per round. Tunable via
+    // --max-smt-attempts. 0 = use the built-in default (5).
+    size_t max_smt_attempts = 5;
 };
 
 // ── Pipeline result ─────────────────────────────────────────────────────

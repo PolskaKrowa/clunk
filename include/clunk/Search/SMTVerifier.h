@@ -177,6 +177,21 @@ struct SMTConfig {
     // (UNSOUND — for testing only).
     bool sound_loop_fallback = true;
 
+    // ── Bounded loop unrolling (implements the historical TODO) ────────
+    // When true, `verify_with_z3` pre-unrolls constant-trip single-block
+    // loops in BOTH the original and the candidate before SMT encoding.
+    // The unroller (search::LoopOptimizer::unroll_constant_loops) is
+    // sound-by-construction — it abstractly interprets the loop to
+    // determine the trip count, and refuses to unroll anything it
+    // cannot prove constant. So a function that previously triggered
+    // `sound_loop_fallback` may now be SMT-verifiable after unrolling.
+    //
+    // Trip count is capped by `max_unrolling` (default 4) — loops with
+    // larger trip counts (or non-constant trip counts) still trigger
+    // `sound_loop_fallback` and return Unknown. Default: false (opt-in
+    // via --smt-bounded-unrolling), to preserve backward compatibility.
+    bool sound_bounded_unrolling = false;
+
     // ── BinOp-flags (nsw/nuw/exact) SMT encoding ───────────────────────
     // When true, the encoder inspects `inst->binop_flags()` for each
     // binary op and wraps the result in `ite(overflow_condition, POISON,

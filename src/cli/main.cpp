@@ -90,6 +90,17 @@ struct CliOptions {
     bool no_honor_binop_flags = false;      // --no-honor-binop-flags
     bool no_path_conditions = false;        // --no-path-conditions
     size_t max_mining_function_size = 8192; // --max-mining-function-size <n>
+
+    // ── SMT tuning flags (new) ─────────────────────────────────────────
+    unsigned smt_timeout_ms = 0;            // --smt-timeout <ms>; 0 = default (30000)
+    size_t smt_max_blocks = 0;              // --smt-max-blocks <n>; 0 = default (20)
+    size_t smt_max_instructions = 0;        // --smt-max-instructions <n>; 0 = default (100)
+    size_t max_smt_attempts = 0;            // --max-smt-attempts <n>; 0 = default (5)
+    bool smt_bounded_unrolling = false;     // --smt-bounded-unrolling
+
+    // ── Cross-function flags (new) ─────────────────────────────────────
+    bool no_cross_function = false;         // --no-cross-function
+    bool no_multiblock_inliner = false;     // --no-multiblock-inliner
 };
 
 static void print_usage(const char* prog) {
@@ -153,6 +164,17 @@ static void print_usage(const char* prog) {
               << "                            above --max-function-size (default 8192; 0 = disable)\n"
               << "  --cache-path <path>       Persistent SMT rewrite cache (file-backed LRU)\n"
               << "  --no-honor-binop-flags    Ignore nsw/nuw/exact flags in SMT encoding (sound fallback)\n"
+              << "\n"
+              << "SMT tuning:\n"
+              << "  --smt-timeout <ms>        Per-call Z3 timeout in ms (default 30000)\n"
+              << "  --smt-max-blocks <n>      Refuse SMT on functions with more than n blocks (default 20)\n"
+              << "  --smt-max-instructions <n>  Refuse SMT on functions with more than n instructions (default 100)\n"
+              << "  --max-smt-attempts <n>    Max SMT verify calls per verify_and_select (default 5)\n"
+              << "  --smt-bounded-unrolling   Pre-unroll constant-trip single-block loops before SMT (sound)\n"
+              << "\n"
+              << "Cross-function optimisation:\n"
+              << "  --no-cross-function       Disable module-level DFE + IPCP pre-pass\n"
+              << "  --no-multiblock-inliner   Disable multi-block (CFG-aware) inliner\n"
               << "\n"
               << "  --version                 Print version\n"
               << "  --help                    Print this help\n"
@@ -338,6 +360,40 @@ static CliOptions parse_args(int argc, char* argv[]) {
             }
         } else if (arg == "--no-honor-binop-flags") {
             opts.no_honor_binop_flags = true;
+        } else if (arg == "--smt-timeout") {
+            if (i + 1 < argc) {
+                opts.smt_timeout_ms = static_cast<unsigned>(std::stoul(argv[++i]));
+            } else {
+                std::cerr << "Error: --smt-timeout requires an argument\n";
+                opts.show_help = true;
+            }
+        } else if (arg == "--smt-max-blocks") {
+            if (i + 1 < argc) {
+                opts.smt_max_blocks = static_cast<size_t>(std::stoull(argv[++i]));
+            } else {
+                std::cerr << "Error: --smt-max-blocks requires an argument\n";
+                opts.show_help = true;
+            }
+        } else if (arg == "--smt-max-instructions") {
+            if (i + 1 < argc) {
+                opts.smt_max_instructions = static_cast<size_t>(std::stoull(argv[++i]));
+            } else {
+                std::cerr << "Error: --smt-max-instructions requires an argument\n";
+                opts.show_help = true;
+            }
+        } else if (arg == "--max-smt-attempts") {
+            if (i + 1 < argc) {
+                opts.max_smt_attempts = static_cast<size_t>(std::stoull(argv[++i]));
+            } else {
+                std::cerr << "Error: --max-smt-attempts requires an argument\n";
+                opts.show_help = true;
+            }
+        } else if (arg == "--smt-bounded-unrolling") {
+            opts.smt_bounded_unrolling = true;
+        } else if (arg == "--no-cross-function") {
+            opts.no_cross_function = true;
+        } else if (arg == "--no-multiblock-inliner") {
+            opts.no_multiblock_inliner = true;
         } else if (arg[0] == '-') {
             std::cerr << "Error: unknown option: " << arg << "\n";
             opts.show_help = true;
@@ -647,6 +703,25 @@ int main(int argc, char* argv[]) {
     if (opts.no_honor_binop_flags) {
         config.smt_config.honor_binop_flags = false;
     }
+
+    // ── SMT tuning flags ───────────────────────────────────────────────
+    if (opts.smt_timeout_ms > 0) {
+        config.smt_config.timeout_ms = opts.smt_timeout_ms;
+    }
+    if (opts.smt_max_blocks > 0) {
+        config.smt_config.max_blocks_for_smt = opts.smt_max_blocks;
+    }
+    if (opts.smt_max_instructions > 0) {
+        config.smt_config.max_instructions_for_smt = opts.smt_max_instructions;
+    }
+    config.smt_config.sound_bounded_unrolling = opts.smt_bounded_unrolling;
+    if (opts.max_smt_attempts > 0) {
+        config.max_smt_attempts = opts.max_smt_attempts;
+    }
+
+    // ── Cross-function flags ───────────────────────────────────────────
+    config.enable_cross_function = !opts.no_cross_function;
+    config.enable_multiblock_inliner = !opts.no_multiblock_inliner;
 
     // ── Per-function time cap ─────────────────────────────────────────────
     config.max_time_per_function = opts.max_time_per_function;

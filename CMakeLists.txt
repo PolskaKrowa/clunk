@@ -38,6 +38,7 @@ set(CLUNK_SOURCES
     src/IR/StrengthReduce.cpp
     src/Analysis/KnownBits.cpp
     src/Analysis/PowersOfTwo.cpp
+    src/Analysis/CallGraph.cpp
     src/Parser/IRParser.cpp
     src/Evaluator/Heuristics.cpp
     src/Evaluator/EvaluationEngine.cpp
@@ -53,6 +54,7 @@ set(CLUNK_SOURCES
     src/Search/LoopOpt.cpp
     src/Search/MemOpt.cpp
     src/Search/Inliner.cpp
+    src/Search/CrossFunctionPasses.cpp
     src/Search/EgraphRewriter.cpp
     src/Search/RewriteCache.cpp
     src/Pattern/PatternLibrary.cpp
