@@ -73,11 +73,13 @@ entry:
 ```
 
 <div align=center>VVV</div>
+
 ```bash
 $ clunk input.ll -o output.ll
 ```
 
 <div align=center>VVV</div>
+
 ```llvm
 ; output.ll
 
