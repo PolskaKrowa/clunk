@@ -72,7 +72,7 @@ entry:
 }
 ```
 
-```sh
+```bash
 $ clunk input.ll -o output.ll
 ```
 
