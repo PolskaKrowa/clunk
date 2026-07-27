@@ -32,7 +32,7 @@
 <path d="M0,0 L1,2 L3,3 L-2,13 L-3,11 Z " fill="#363536" transform="translate(841,341)"/>
 <path d="M0,0 L3,1 L1,3 L-8,4 L-6,2 Z " fill="#323232" transform="translate(863,390)"/>
 </svg>
-*With a good set of tools, even anvils can move fast.*
+<i>With a good set of tools, even anvils can move fast.*</i>
 </div>
 
 **Clunk** is an LLVM IR superoptimiser. It takes LLVM IR (`.ll` files) and
