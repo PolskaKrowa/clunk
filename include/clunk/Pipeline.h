@@ -35,6 +35,7 @@
 #include "clunk/Search/StochasticSearch.h"
 #include "clunk/Search/EvolutionarySearch.h"
 #include "clunk/Search/SMTVerifier.h"
+#include "clunk/Search/AliveVerifier.h"
 #include "clunk/Search/PeepholeMiner.h"
 #include "clunk/Search/EgraphRewriter.h"
 #include "clunk/Search/RewriteCache.h"
@@ -104,6 +105,23 @@ struct PipelineConfig {
     search::StochasticConfig stochastic_config;
     search::EvolutionaryConfig evolutionary_config;
     search::SMTConfig smt_config;
+
+    // ── Alive2 (alive-tv) second-opinion verification ───────────────────
+    // OFF by default: alive-tv is an external binary (see
+    // AliveVerifier.h), not something clunk ships or dlopens, so this is
+    // opt-in. When enabled, every candidate that SMTVerifier (or a
+    // sound-by-construction rewrite) already blessed is additionally
+    // checked with alive-tv before being adopted. alive-tv covers more of
+    // LLVM's real semantics than clunk's own encoder (memory, calls,
+    // more of the poison/UB model) and — critically — runs the candidate
+    // through LLVM's actual .ll parser, so it also catches cases where
+    // clunk's own printer emitted invalid IR. A candidate alive-tv
+    // REFUTES is never adopted, even if SMT said Equivalent (that
+    // combination means clunk's own SMT encoding has a soundness bug).
+    // If no Alive2 backend is found (libAlive2.so or alive-tv binary),
+    // this silently degrades to a no-op — see AliveVerifier::is_available().
+    bool enable_alive2 = false;
+    search::AliveConfig alive_config;
 
     // SMT-verified peephole miner (Souper-style enumerative superoptimisation).
     // At opt_level >= 2 the miner runs as one more candidate source per round:
@@ -382,6 +400,7 @@ private:
         search::StochasticSearch stochastic;
         search::EvolutionarySearch evolutionary;
         search::SMTVerifier smt;
+        search::AliveVerifier alive;    // second-opinion gate; see enable_alive2
         uint64_t last_mined_hash = 0;   // peephole-mining guard, reset per fn
         uint64_t last_egraph_hash = 0;  // e-graph guard, reset per fn
         uint64_t last_vector_hash = 0;  // vector-synthesis guard, reset per fn
@@ -396,7 +415,8 @@ private:
         Searchers(const PipelineConfig& cfg, evaluator::EvaluationEngine* eng)
             : stochastic(cfg.stochastic_config, eng),
               evolutionary(cfg.evolutionary_config, eng),
-              smt(cfg.smt_config) {}
+              smt(cfg.smt_config),
+              alive(cfg.alive_config) {}
     };
 
     // Optimise one function using the given per-thread search state. The public

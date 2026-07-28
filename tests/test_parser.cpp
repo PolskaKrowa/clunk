@@ -150,6 +150,147 @@ void test_parse_global_variables() {
     CHECK(mod->function_count() == 1, "module has 1 function");
 }
 
+// Regression test: `@name = external global <type>, align N` (a
+// declaration — no initializer) must round-trip through
+// parse -> to_string() -> parse without becoming invalid IR. This used
+// to print as `@name = global <type> , align N` — missing the `external`
+// keyword and with a stray leading comma where LLVM expects a value —
+// which llvm-as/opt/alive-tv all reject with "expected value token".
+void test_external_global_declaration_round_trips() {
+    IRParser parser;
+    const char* ir = R"(
+        @stdin = external dso_local global ptr, align 8
+
+        define ptr @get_stdin() {
+        entry:
+          %v = load ptr, ptr @stdin, align 8
+          ret ptr %v
+        }
+    )";
+    auto mod = parser.parse_string(ir);
+    CHECK(mod != nullptr, "parse returned non-null");
+    if (!mod) return;
+
+    const auto& globals = mod->globals();
+    CHECK(globals.size() == 1, "module has exactly 1 global");
+    if (globals.empty()) return;
+    CHECK(globals[0].is_declaration, "'external global' must be marked as a declaration");
+    CHECK(globals[0].init_value.empty() || globals[0].init_value.front() == ',',
+          "a declaration must not have captured a bogus initializer value");
+
+    std::string text = mod->to_string();
+    CHECK(text.find("@stdin = external global") != std::string::npos,
+          "printed global must include the 'external' keyword (got:\n" + text + ")");
+    CHECK(text.find("global ptr ,") == std::string::npos,
+          "printed global must NOT have a bare type-then-comma with no value "
+          "(the exact 'expected value token' bug)");
+    // The load must reference the GLOBAL @stdin, not a phantom local
+    // %stdin — see test_global_operand_keeps_at_sigil for the isolated
+    // regression this depends on.
+    CHECK(text.find("ptr @stdin") != std::string::npos,
+          "load operand must reference @stdin, not %stdin (got:\n" + text + ")");
+
+    // And it must re-parse without error — the actual round-trip check.
+    IRParser parser2;
+    auto reparsed = parser2.parse_string(text);
+    CHECK(reparsed != nullptr,
+          "printer output for an external global declaration failed to "
+          "re-parse:\n" + text);
+}
+
+// Regression test: an operand that references a global directly (not
+// via a `call`) — e.g. `load ptr, ptr @stdin` — must keep its `@` sigil.
+// Value::to_string()/print_as_operand() used to always print "%name"
+// for every named Value, so parsing `@stdin` and re-printing it produced
+// `%stdin`: a reference to an undefined local SSA value.
+void test_global_operand_keeps_at_sigil() {
+    IRParser parser;
+    const char* ir = R"(
+        @g = global i32 0, align 4
+
+        define i32 @read_g() {
+        entry:
+          %v = load i32, ptr @g, align 4
+          ret i32 %v
+        }
+    )";
+    auto mod = parser.parse_string(ir);
+    CHECK(mod != nullptr, "parse returned non-null");
+    if (!mod) return;
+    auto fn = mod->function("read_g");
+    CHECK(fn != nullptr, "function 'read_g' found");
+    if (!fn) return;
+    auto entry = fn->entry_block();
+    CHECK(entry != nullptr, "entry block found");
+    if (!entry) return;
+    CHECK(entry->size() >= 1, "entry block has instructions");
+    auto load_inst = entry->instruction(0);
+    CHECK(load_inst != nullptr, "load instruction found");
+    if (!load_inst || load_inst->num_operands() == 0) return;
+    auto ptr_operand = load_inst->operand(load_inst->num_operands() - 1);
+    CHECK(ptr_operand->is_global(), "load's pointer operand must be marked is_global()");
+    CHECK(ptr_operand->print_as_operand() == "@g",
+          "pointer operand must print as '@g', got '" +
+          ptr_operand->print_as_operand() + "'");
+}
+
+// Regression test: LLVM 18+'s `captures(none)` parameter attribute (the
+// replacement for the older standalone `nocapture`) must not desync the
+// parameter-list parser. Before "captures" was added to the keyword
+// table, the lexer tokenized it as a plain Identifier, so
+// collect_param_attrs stopped consuming right before it, and "captures",
+// "(", and "none" were each fed to parse_type() as if they were separate
+// parameters — which doesn't recognize any of them and silently returns
+// void, turning one real `ptr` parameter into `(ptr, void, void, void)`
+// and consuming the wrong closing paren for the rest of the signature.
+void test_captures_attribute_does_not_corrupt_params() {
+    IRParser parser;
+    const char* ir = R"(
+        define dso_local void @rot13(ptr noundef captures(none) %s) local_unnamed_addr #0 {
+        entry:
+          ret void
+        }
+    )";
+    auto mod = parser.parse_string(ir);
+    CHECK(mod != nullptr, "parse returned non-null");
+    if (!mod) return;
+    auto fn = mod->function("rot13");
+    CHECK(fn != nullptr, "function 'rot13' found");
+    if (!fn) return;
+    CHECK(fn->argument_count() == 1,
+          "rot13 must have exactly 1 parameter, got " +
+          std::to_string(fn->argument_count()));
+    if (fn->argument_count() >= 1) {
+        CHECK(!fn->arguments()[0].type->is_void(),
+              "the single parameter must not have been corrupted into void");
+        CHECK(fn->arguments()[0].type->is_pointer(),
+              "the single parameter should still be a pointer type");
+    }
+    std::string text = fn->to_string();
+    CHECK(text.find("void, void") == std::string::npos,
+          "printed signature must not contain cascaded void parameters "
+          "(got: " + text.substr(0, 80) + ")");
+
+    // Multi-component form: captures(address, read_provenance)
+    IRParser parser2;
+    const char* ir2 = R"(
+        define ptr @get_env(ptr noundef dereferenceable_or_null(64) captures(address, read_provenance) %s) {
+        entry:
+          ret ptr %s
+        }
+    )";
+    auto mod2 = parser2.parse_string(ir2);
+    CHECK(mod2 != nullptr, "second parse returned non-null");
+    if (!mod2) return;
+    auto fn2 = mod2->function("get_env");
+    CHECK(fn2 != nullptr, "function 'get_env' found");
+    if (fn2) {
+        CHECK(fn2->argument_count() == 1,
+              "get_env must have exactly 1 parameter, got " +
+              std::to_string(fn2->argument_count()));
+    }
+}
+
 void test_parse_void_function() {
     IRParser parser;
     const char* ir = R"(
@@ -403,6 +544,15 @@ int main() {
 
     std::cout << "  Global variables..." << std::endl;
     test_parse_global_variables();
+
+    std::cout << "  External global declaration round-trips..." << std::endl;
+    test_external_global_declaration_round_trips();
+
+    std::cout << "  Global operand keeps '@' sigil..." << std::endl;
+    test_global_operand_keeps_at_sigil();
+
+    std::cout << "  captures(none)/dereferenceable_or_null don't corrupt params..." << std::endl;
+    test_captures_attribute_does_not_corrupt_params();
 
     std::cout << "  Void function..." << std::endl;
     test_parse_void_function();

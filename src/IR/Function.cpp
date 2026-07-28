@@ -70,11 +70,18 @@ std::string Function::to_string() const {
     std::string s;
     s.reserve(256);
 
-    // Linkage keyword
-    s.append(linkage_name(linkage_));
-
-    // "define <return_type> @<name>(<args>)<attrs> {"
+    // "define [linkage] <return_type> @<name>(<args>)<attrs> {"
+    //
+    // LLVM IR syntax places the linkage keyword AFTER "define", not
+    // before it (e.g. `define internal i32 @f(...)`, never
+    // `internal define i32 @f(...)`). Emitting it in front of "define"
+    // produces text that neither clunk's own parser (see
+    // IRParser::parse_function_def, which looks for linkage keywords
+    // right after "define"), nor clang/opt, nor Alive2's `alive-tv` can
+    // parse — see AliveVerifier and scripts/diff_test_alive.sh, which
+    // feed this output straight to alive-tv as the "target" module.
     s.append("define ");
+    s.append(linkage_name(linkage_));
     s.append(fn_type_->return_type()->to_string());
     s.append(" @");
     s.append(name_);

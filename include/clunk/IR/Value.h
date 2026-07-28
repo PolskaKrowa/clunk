@@ -32,8 +32,20 @@ namespace clunk::ir {
 
 class Value {
 public:
-    Value(std::shared_ptr<Type> type, const std::string& name = "")
-        : type_(type), name_(name) {}
+    // `is_global` marks this Value as a reference to a module-level
+    // global (a `@name`), as opposed to a local SSA name (`%name`).
+    // Without this, a parsed operand like `@stdin` and a local `%stdin`
+    // were indistinguishable once the sigil was stripped during parsing
+    // (see IRParser::parse_value's '@' branch) — to_string()/
+    // print_as_operand() always re-added "%", so any instruction that
+    // referenced a global directly (loads/stores/GEPs on `@stdin`,
+    // `@.str`, etc. — anything other than a `call`, whose callee is
+    // tracked separately via Instruction metadata) got silently
+    // rewritten to reference an undefined local value instead, which
+    // clang/opt/alive-tv/llvm-as all reject.
+    Value(std::shared_ptr<Type> type, const std::string& name = "",
+          bool is_global = false)
+        : type_(type), name_(name), is_global_(is_global) {}
     virtual ~Value() = default;
 
     std::shared_ptr<Type> type() const { return type_; }
@@ -41,9 +53,11 @@ public:
     void set_name(const std::string& n) { name_ = n; }
 
     bool has_name() const { return !name_.empty(); }
+    bool is_global() const { return is_global_; }
+    void set_is_global(bool g) { is_global_ = g; }
 
     virtual std::string to_string() const {
-        if (has_name()) return "%" + name_;
+        if (has_name()) return (is_global_ ? "@" : "%") + name_;
         return "<unnamed>";
     }
 
@@ -59,6 +73,7 @@ public:
 protected:
     std::shared_ptr<Type> type_;
     std::string name_;
+    bool is_global_ = false;
 };
 
 // ── Constant values ─────────────────────────────────────────────────────

@@ -1414,6 +1414,41 @@ std::shared_ptr<ir::Function> Pipeline::verify_and_select(
         ++smt_attempts;
         auto vr = s.smt.verify(original, *sc.candidate->function);
         if (vr.is_safe()) {
+            // ── Optional Alive2 second opinion ───────────────────────────
+            // SMT said this candidate is safe. If --alive2 is enabled,
+            // get a second, independent verdict from alive-tv before
+            // trusting it. alive-tv can prove things clunk's own encoder
+            // structurally cannot (memory, calls, more of the poison/UB
+            // model) and parses the candidate through LLVM's real .ll
+            // grammar, so a REFUTED verdict here means either an SMT
+            // soundness bug or an invalid-IR-emission bug — either way,
+            // this candidate must NOT be adopted even though SMT blessed
+            // it. Unknown/Error/NotAvailable are not held against the
+            // candidate: SMT's proof stands on its own in that case,
+            // exactly as it did before --alive2 existed.
+            if (config_.enable_alive2) {
+                auto ar = s.alive.verify(original, *sc.candidate->function);
+                if (ar.status == search::AliveResult::Refuted) {
+                    if (config_.verbose) {
+                        std::cerr << "  [alive2] " << original.name()
+                                  << ": *** SOUNDNESS BUG *** SMT proved "
+                                     "Equivalent but alive-tv REFUTED refinement "
+                                     "— rejecting candidate ("
+                                  << ar.message << ")\n";
+                    }
+                    uint64_t chash = sc.candidate->structural_hash;
+                    if (chash == 0) {
+                        chash = search::StochasticSearch::structural_hash(
+                            *sc.candidate->function);
+                    }
+                    s.rejected_hashes.insert(chash);
+                    continue;
+                }
+                if (config_.verbose && ar.status != search::AliveResult::Verified) {
+                    std::cerr << "  [alive2] " << original.name() << ": "
+                              << ar.message << " (adopting on SMT proof alone)\n";
+                }
+            }
             result.verified = true;
             return sc.candidate->function;
         }

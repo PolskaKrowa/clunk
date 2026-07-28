@@ -8,6 +8,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 # ── Options ──────────────────────────────────────────────────────────────────
 option(CLUNK_ENABLE_Z3 "Enable Z3 SMT verification (runtime, via dlopen)" ON)
+option(CLUNK_ENABLE_ALIVE2 "Enable Alive2 verification (runtime, via dlopen)" ON)
 option(CLUNK_ENABLE_TESTS "Build test suite" ON)
 option(CLUNK_ENABLE_BENCHMARKS "Build benchmarks" ON)
 option(CLUNK_ENABLE_GPU "Enable GPU/PTX optimisation stubs" ON)
@@ -21,6 +22,20 @@ if(CLUNK_ENABLE_Z3)
     message(STATUS "Z3 SMT verification: ENABLED (runtime dlopen, no link-time dependency)")
 else()
     message(STATUS "Z3 SMT verification: DISABLED")
+endif()
+
+# ── Alive2 ─────────────────────────────────────────────────────────────────────
+# Alive2 is a purely runtime dependency loaded via dlopen/dlsym.
+# There is NO link-time dependency on libAlive2 — we only need -ldl.
+# The vendored alive2_c.h is kept under vendor/alive2/ for reference.
+# At runtime, AliveVerifier auto-detects:
+#   1. libAlive2.so (in-process, preferred)
+#   2. alive-tv binary on PATH (out-of-process fallback)
+if(CLUNK_ENABLE_ALIVE2)
+    add_compile_definitions(CLUNK_HAS_ALIVE2=1)
+    message(STATUS "Alive2 verification: ENABLED (runtime dlopen, no link-time dependency)")
+else()
+    message(STATUS "Alive2 verification: DISABLED")
 endif()
 
 # ── Core library ─────────────────────────────────────────────────────────────
@@ -49,6 +64,8 @@ set(CLUNK_SOURCES
     src/Search/StochasticSearch.cpp
     src/Search/EvolutionarySearch.cpp
     src/Search/SMTVerifier.cpp
+    src/Search/AliveDynamicLoader.cpp
+    src/Search/AliveVerifier.cpp
     src/Search/PeepholeMiner.cpp
     src/Search/VectorSynth.cpp
     src/Search/LoopOpt.cpp
@@ -103,8 +120,8 @@ target_include_directories(clunk_core PUBLIC
     ${CMAKE_SOURCE_DIR}/vendor
 )
 
-if(CLUNK_ENABLE_Z3)
-    # Z3 is loaded at runtime via dlopen — we only need -ldl
+if(CLUNK_ENABLE_Z3 OR CLUNK_ENABLE_ALIVE2)
+    # Both Z3 and Alive2 are loaded at runtime via dlopen — we only need -ldl
     target_link_libraries(clunk_core PUBLIC dl)
 endif()
 
@@ -147,6 +164,7 @@ install(TARGETS clunk_core clunk
 )
 install(DIRECTORY include/clunk DESTINATION include)
 install(DIRECTORY vendor/z3 DESTINATION include/clunk/vendor)
+install(DIRECTORY vendor/alive2 DESTINATION include/clunk/vendor)
 install(FILES
     ${CMAKE_BINARY_DIR}/ClunkConfig.cmake
     ${CMAKE_BINARY_DIR}/ClunkConfigVersion.cmake

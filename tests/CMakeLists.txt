@@ -16,6 +16,7 @@ set(TEST_SOURCES
     test_smt
     test_smt_soundness
     test_smt_cegis
+    test_alive_verifier
     test_rewrite_cache
     test_cost_model_tti
     test_vector_synth

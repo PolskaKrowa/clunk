@@ -122,6 +122,11 @@ struct CliOptions {
     // ── Cross-function flags (new) ─────────────────────────────────────
     bool no_cross_function = false;         // --no-cross-function
     bool no_multiblock_inliner = false;     // --no-multiblock-inliner
+
+    // ── Alive2 second-opinion verification ──────────────────────────────
+    bool alive2 = true;                     // alive2
+    std::string alive_tv_path = "alive-tv"; // --alive-tv-path <path>
+    unsigned alive_timeout_ms = 30000;      // --alive-timeout <ms>
 };
 
 static void print_usage(const char* prog) {
@@ -153,6 +158,9 @@ static void print_usage(const char* prog) {
               << "  --target <triple>         Target triple (default: host)\n"
               << "  --time-budget <seconds>   Time budget in seconds (default: 30; 0 = no limit)\n"
               << "  --no-z3                   Disable Z3 verification\n"
+              << "  --no-alive2               Disable Alive2 verification\n"
+              << "  --alive-tv-path <path>    Path to the alive-tv binary (default: alive-tv on PATH)\n"
+              << "  --alive-timeout <ms>      Per-candidate alive-tv timeout in ms (default 30000)\n"
               << "  --no-gpu                  Disable GPU optimisation\n"
               << "  --no-miner                Disable the in-loop SMT-verified peephole miner\n"
               << "  --no-vector-synth         Disable SMT-verified vector-intrinsic synthesis\n"
@@ -270,6 +278,22 @@ static CliOptions parse_args(int argc, char* argv[]) {
             }
         } else if (arg == "--no-z3") {
             opts.no_z3 = true;
+        } else if (arg == "--no-alive2") {
+            opts.alive2 = false;
+        } else if (arg == "--alive-tv-path") {
+            if (i + 1 < argc) {
+                opts.alive_tv_path = argv[++i];
+            } else {
+                std::cerr << "Error: --alive-tv-path requires an argument\n";
+                opts.show_help = true;
+            }
+        } else if (arg == "--alive-timeout") {
+            if (i + 1 < argc) {
+                opts.alive_timeout_ms = static_cast<unsigned>(std::stoul(argv[++i]));
+            } else {
+                std::cerr << "Error: --alive-timeout requires an argument\n";
+                opts.show_help = true;
+            }
         } else if (arg == "--no-gpu") {
             opts.no_gpu = true;
         } else if (arg == "--no-miner") {
@@ -773,6 +797,17 @@ int main(int argc, char* argv[]) {
     if (opts.no_z3) {
         config.skip_smt = true;
     }
+
+    // ── Alive2 second-opinion verification ──────────────────────────────
+    config.enable_alive2 = opts.alive2;
+    config.alive_config.alive_tv_path = opts.alive_tv_path;
+    config.alive_config.timeout_ms = opts.alive_timeout_ms;
+    // Reuse the module's own target info (if the input .ll specified one)
+    // so alive-tv reasons about the same triple/datalayout clang used.
+    config.alive_config.target_triple =
+        module->has_target() ? module->target().triple : "";
+    config.alive_config.target_datalayout =
+        module->has_target() ? module->target().datalayout : "";
 
     // ── Scale-control flags ───────────────────────────────────────────────
     config.max_function_size = opts.max_function_size;

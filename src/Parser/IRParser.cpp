@@ -64,10 +64,25 @@ static const std::unordered_set<std::string> llvm_keywords = {
     "global", "constant",
     // Parameter attributes
     "signext", "zeroext", "byval", "sret", "noalias", "nocapture", "nest",
-    "returned", "nonnull", "dereferenceable", "inreg", "swiftself",
-    "swiftasync", "swift_error", "noundef", "elementtype", "align",
-    "readonly", "writeonly", "readnone", "immarg", "allocptr",
-    "byref", "preallocated", "fpclass", "nofpclass",
+    "returned", "nonnull", "dereferenceable", "dereferenceable_or_null",
+    "inreg", "swiftself", "swiftasync", "swift_error", "noundef",
+    "elementtype", "align", "readonly", "writeonly", "readnone", "immarg",
+    "allocptr", "byref", "preallocated", "fpclass", "nofpclass",
+    // "captures(...)" (LLVM 18+) replaced the standalone "nocapture"
+    // attribute with a parenthesised capture-component list, e.g.
+    // `captures(none)`, `captures(address)`,
+    // `captures(address, read_provenance)`. "writable", "dead_on_unwind"
+    // and "initializes(...)" are newer memory-effect param attributes
+    // clang emits alongside it. Without these in the keyword table, the
+    // lexer tokenizes "captures" as a plain Identifier, so
+    // collect_param_attrs' `while (peek == Keyword)` loop stops right
+    // before it, and each of "captures" / "(" / "none" then gets fed to
+    // parse_type() one at a time — which doesn't recognize any of them
+    // and falls through to its "unknown token -> void" fallback, turning
+    // one real parameter into a cascade of bogus void "parameters" and
+    // consuming the WRONG closing paren as the end of the parameter
+    // list (see the "ptr, void, void, void" class of bug reports).
+    "captures", "writable", "dead_on_unwind", "initializes", "range",
     // Function attributes
     "nounwind", "uwtable", "mustprogress", "nosync",
     "nofree", "willreturn", "optnone", "noinline", "alwaysinline",
@@ -716,12 +731,41 @@ void IRParser::parse_global(std::shared_ptr<ir::Module> mod) {
     ir::GlobalValue gv;
     gv.name = "@" + name_tok.text;
 
-    // Parse optional linkage / global / constant keywords
+    // Parse optional linkage / global / constant keywords. Unlike the
+    // previous version of this loop (which threw every keyword but
+    // "constant"/"global" away), we now record the actual linkage so it
+    // round-trips, and remember whether we saw a linkage that implies
+    // "no initializer follows" (external / extern_weak) — LLVM requires
+    // one of those keywords whenever a global has no initializer value,
+    // and the printer needs to know to re-emit it (see is_declaration).
     while (peek_token().type == TokenType::Keyword) {
         auto kw = peek_token().text;
         if (kw == "constant") { gv.is_constant = true; next_token(); break; }
         if (kw == "global")   { next_token(); break; }
-        // Skip other keywords (linkage, dso_local, unnamed_addr, etc.)
+        if (kw == "internal")    { gv.linkage = ir::Linkage::Internal;    next_token(); continue; }
+        if (kw == "private")     { gv.linkage = ir::Linkage::Private;     next_token(); continue; }
+        if (kw == "weak")        { gv.linkage = ir::Linkage::Weak;        next_token(); continue; }
+        if (kw == "linkonce")    { gv.linkage = ir::Linkage::LinkOnce;    next_token(); continue; }
+        if (kw == "linkonce_odr"){ gv.linkage = ir::Linkage::LinkOnceODR; next_token(); continue; }
+        if (kw == "weak_odr")    { gv.linkage = ir::Linkage::WeakODR;     next_token(); continue; }
+        if (kw == "common")      { gv.linkage = ir::Linkage::Common;      next_token(); continue; }
+        if (kw == "appending")   { gv.linkage = ir::Linkage::Appending;   next_token(); continue; }
+        if (kw == "available_externally") {
+            gv.linkage = ir::Linkage::AvailableExternally; next_token(); continue;
+        }
+        if (kw == "external") {
+            gv.linkage = ir::Linkage::External;
+            gv.is_declaration = true;
+            next_token();
+            continue;
+        }
+        if (kw == "extern_weak") {
+            gv.linkage = ir::Linkage::ExternalWeak;
+            gv.is_declaration = true;
+            next_token();
+            continue;
+        }
+        // Skip other keywords (dso_local, unnamed_addr, thread_local, etc.)
         next_token();
     }
 
@@ -768,6 +812,20 @@ void IRParser::parse_global(std::shared_ptr<ir::Module> mod) {
             next_token();
         }
         gv.init_value = init_str;
+
+        // Defensive fallback: even if we didn't see an explicit
+        // `external`/`extern_weak` keyword (e.g. a hand-written/odd input
+        // that omits it), a captured string that is empty or starts
+        // directly with "," means no initializer VALUE token was present
+        // before the trailing attributes (align/section/...) — i.e. this
+        // is structurally a declaration. Without this, Module::to_string()
+        // would print `global <type> , align N` (a leading-comma-after-
+        // space typo LLVM rejects with "expected value token") instead of
+        // `external global <type>, align N`.
+        if (!gv.is_declaration &&
+            (gv.init_value.empty() || gv.init_value.front() == ',')) {
+            gv.is_declaration = true;
+        }
     }
 
     mod->add_global(gv);
@@ -2168,7 +2226,17 @@ std::shared_ptr<ir::Value> IRParser::parse_value(std::shared_ptr<ir::Type> expec
         auto name = parse_name();
         auto ptr_type = expected_type->is_pointer() ? expected_type :
                         type_ctx_.pointer_to(expected_type);
-        auto val = std::make_shared<ir::Value>(ptr_type, name);
+        // Reuse the same Value object for repeated references to the
+        // same global within this function (mirrors the %name dedup
+        // just above) — keyed with a "@" prefix in value_table_ so it
+        // can never collide with a local SSA name of the same text.
+        const std::string key = "@" + name;
+        auto it = value_table_.find(key);
+        if (it != value_table_.end()) {
+            return it->second;
+        }
+        auto val = std::make_shared<ir::Value>(ptr_type, name, /*is_global=*/true);
+        value_table_[key] = val;
         return val;
     }
 

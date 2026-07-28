@@ -62,6 +62,12 @@ public:
         : name_(name), fn_type_(fn_type), linkage_(linkage) {}
 
     const std::string& name() const { return name_; }
+    // Rename in place. Does NOT fix up call sites elsewhere that reference
+    // the old name (mirrors Module::remove_function's contract) — callers
+    // are responsible for that. Primarily used to align a candidate's name
+    // with the original's before an external tool that matches functions
+    // by name across two modules (see AliveVerifier).
+    void set_name(const std::string& name) { name_ = name; }
     std::shared_ptr<FunctionType> function_type() const { return fn_type_; }
     std::shared_ptr<Type> return_type() const { return fn_type_->return_type(); }
     Linkage linkage() const { return linkage_; }

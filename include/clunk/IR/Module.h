@@ -35,6 +35,16 @@ struct GlobalValue {
     Linkage linkage = Linkage::External;
     bool is_constant = false;
     unsigned alignment = 0;
+
+    // True iff this is a declaration (no initializer), e.g.
+    // `@g = external global i32`. LLVM IR requires the `external`
+    // keyword (or another declaration-implying linkage such as
+    // `extern_weak`) whenever no initializer value is present — printing
+    // `global <type>` with no keyword and no value is invalid syntax.
+    // See Module::to_string(): default-constructed (false) preserves the
+    // old "always a definition" assumption for any code that builds a
+    // GlobalValue directly rather than via the parser.
+    bool is_declaration = false;
 };
 
 struct ModuleFlag {

@@ -76,6 +76,15 @@ entry:
 
 ```bash
 $ clunk input.ll -o output.ll
+
+
+=== Clunk Summary ===
+Functions processed: 5
+Functions optimised: 1
+Average improvement:  5.53571x
+Total time:           553.588 ms
+
+$ █
 ```
 
 <div align=center>VVV</div>
@@ -83,7 +92,8 @@ $ clunk input.ll -o output.ll
 ```llvm
 ; output.ll
 
-internal define i32 @double(i32 %x) {
+; ModuleID = ''
+define internal i32 @double(i32 %x) {
 entry:
   %r = shl i32 %x, 1
   ret i32 %r
@@ -109,7 +119,7 @@ entry:
   ret i32 %s
 }
 
-internal define i32 @double_if_pos.ipcp_0_5(i32 %x) {
+define internal i32 @double_if_pos.ipcp_0_5(i32 %x) {
 entry:
   br label %then
 then:
@@ -117,8 +127,10 @@ then:
 }
 ```
 
-Clunk found 2 dead functions, interprocedural constants and an inlineable call site, verified it against the
-original with Z3, and rewrote the IR accordingly, All while evaluating each function with their own thread (the input program was small enough to allow for that, larger programs with many functions may assign multiple functions per thread, allowing clunk to quickly find cross-function optimisation opportunities, if any.)
+Clunk found 2 dead functions, 1 interprocedural constant and an inlineable call site; removed 1 unreachable block; folded 1 known-constant value, a comarison and a branch, verified it against the
+original with Z3 + Alive2, and rewrote the IR accordingly, All while evaluating each function with their own thread (the input program was small enough to allow for that, larger programs with many functions may assign multiple functions per thread, allowing clunk to quickly find cross-function optimisation opportunities, if any.)
+
+One future addition to Clunk will be to add comments to the optimised IR which shows exactly what clunk did to optimise the code, making it easier for LLVM developers to write stronger optimisation passes.
 
 ## Features
 

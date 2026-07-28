@@ -197,11 +197,29 @@ std::string Module::to_string() const {
 
     // Global variables — emit in canonical LLVM IR form:
     //   @name = [linkage] [constant|global] [type] [init_value] [, align N]
+    // Declarations (no initializer, e.g. `@g = external global i32`) are
+    // handled specially: LLVM requires the `external`/`extern_weak`
+    // keyword whenever there's no initializer value, and the type must
+    // NOT be followed by a bare `,` with nothing in between — both of
+    // those produce a parse error ("expected value token").
     for (const auto& gv : globals_) {
         s.append(gv.name);
         s.append(" = ");
-        const char* linkage_str = linkage_name(gv.linkage);
-        s.append(linkage_str);
+        if (gv.is_declaration) {
+            // `external` has no dedicated Linkage enum value distinct
+            // from a normal externally-linked definition (linkage_name()
+            // prints "" for Linkage::External, since a *defined* global
+            // needs no keyword) — so for declarations we print "external"
+            // explicitly unless the linkage is itself a keyword that
+            // already implies "no initializer" (e.g. extern_weak).
+            if (gv.linkage == Linkage::External) {
+                s.append("external ");
+            } else {
+                s.append(linkage_name(gv.linkage));
+            }
+        } else {
+            s.append(linkage_name(gv.linkage));
+        }
         if (gv.is_constant) {
             s.append("constant ");
         } else {
@@ -213,7 +231,14 @@ std::string Module::to_string() const {
             s.append("ptr");  // fallback if type was lost during parsing
         }
         if (!gv.init_value.empty()) {
-            s += ' ';
+            // A captured init_value that starts with ',' is trailing
+            // attributes only (align/section/...) with no actual
+            // initializer before it — happens for declarations — and
+            // must NOT get an extra separating space (that space is what
+            // produced the invalid `ptr , align 8` text).
+            if (gv.init_value.front() != ',') {
+                s += ' ';
+            }
             s.append(gv.init_value);
         }
         if (gv.alignment > 0) {

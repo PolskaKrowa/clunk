@@ -502,9 +502,13 @@ std::string Instruction::to_string() const {
     // -- Call --
     if (opcode_ == Opcode::Call) {
         auto it = metadata_.find("callee");
-        s += '%';
-        s.append(name_);
-        s.append(" = call ");
+        const bool is_void_call = type_->is_void();
+        if (!is_void_call) {
+            s += '%';
+            s.append(name_);
+            s.append(" = ");
+        }
+        s.append("call ");
         s.append(type_->to_string());
         s.append(" @");
         s.append(it != metadata_.end() ? it->second : std::string("<unknown>"));
