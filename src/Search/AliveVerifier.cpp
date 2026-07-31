@@ -74,7 +74,7 @@ std::string shell_quote(const std::string& s) {
         if (c == '\'') q += "'\\''";
         else q += c;
     }
-    q += '\'";
+    q += '\'';
     return q;
 }
 

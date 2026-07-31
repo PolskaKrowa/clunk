@@ -202,6 +202,7 @@ clunk [options] <input.ll>
 | `--pattern-library <path>` | Path to a pattern library file |
 | `--report-json` | Write a JSON report of the search to stdout |
 | `--no-z3` | Disable SMT verification |
+| `--no-alive2` | Disable Alive2 verification (not recommended, as I don't fully trust clunk's codegen fully yet) |
 | `--no-gpu` | Disable GPU/PTX passes |
 | `--no-miner` | Disable peephole miner |
 | `--no-vector-synth` | Disable vector synthesis |

@@ -15,7 +15,7 @@ entry:
 define internal i32 @double_if_pos(i32 %x) {
 entry:
   %cmp = icmp sge i32 %x, 0
-  br i1 %cmp, %then, %else
+  br i1 %cmp, label %then, label %else
 then:
   %r = call i32 @double(i32 %x)
   ret i32 %r
