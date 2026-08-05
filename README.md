@@ -180,7 +180,7 @@ One future addition to Clunk will be to add comments to the optimised IR which s
 
 - CMake 3.20 or later
 - A C++17 compiler (GCC or Clang)
-- Optional: Z3 shared library (runtime, for SMT verification)
+- Optional: Z3 + Alive2 shared libraries (loaded at runtime)
 - Optional: llvm-mca (for MCA-based cost model)
 
 ### Build instructions
