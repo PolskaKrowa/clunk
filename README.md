@@ -174,6 +174,14 @@ One future addition to Clunk will be to add comments to the optimised IR which s
 > Instances where E-graphs return non-functional LLVM code should **NOT** be reported as a bug, as it's already a known issue.
 > It is therefore disabled by default and can be re-enabled with the `--egraph` flag.
 
+>[!WARNING]
+> **Vector synthesis is not guaranteed to generate optimal vectorised code from scalar inputs**
+>
+> Code vectorisation is a very difficult task even for computers to perform efficiently and effectively for large operation spaces.
+> If at any point you notice clunk generating vectorised code that ends up being slower than the original, or if clunk misses an opportunity
+> to create viable and performant vector code in comparison to a scalar equivalent, Please open an issue describing the exact function that was
+> processed (or should've been processed) by clunk and what clunk has generated as its "ideal output".
+
 ## Building
 
 ### Requirements
