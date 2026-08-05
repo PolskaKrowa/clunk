@@ -18,6 +18,11 @@ searches for instruction-level optimisations using stochastic search,
 evolutionary algorithms, SMT verification (via Z3), e-graph rewriting, and
 peephole mining. Written in C++17 and built with CMake.
 
+>[!NOTE]
+> This program is ***NOT*** intended to override LLVM's existing optimisation passes.
+> Instead, it is to provide *additional* optimisations that clang/llvm-opt have missed
+> for larger programs using atypical coding styles.
+
 Version: v0.1.0
 
 ## Example
@@ -130,6 +135,14 @@ then:
 Clunk found 2 dead functions, 1 interprocedural constant and an inlineable call site; removed 1 unreachable block; folded 1 known-constant value, a comarison and a branch, verified it against the
 original with Z3 + Alive2, and rewrote the IR accordingly, All while evaluating each function with their own thread (the input program was small enough to allow for that, larger programs with many functions may assign multiple functions per thread, allowing clunk to quickly find cross-function optimisation opportunities, if any.)
 
+A Known limitation of clunk is that it's unable to pre-process arithmetical operations made within a program. LLVM-opt is known for its ability to do so, so the above program is *not* optimal.
+The "optimal" code would be to simply have `@main()` return 20, and have every preceding function before it stripped out for dead code. We're currently looking at ways for clunk to quickly step through
+the input code and find instances where a function (or a set of functions, collectively) returns a singular constant, or can be simplified to a single operation involving both a constant and a few operations.
+
+We understand that creating an optimisation step that does this to the extreme may result in some programs (especially those designed to use a specific algorithm, or a set thereof, to compute numerical constants) to simply
+contain the fully computed constant in a variable and return it, since an optimiser like this would have no idea whether a program is explicitly intended for computational stress-testing or as a single-use constant
+calculator that always returns the same value, albeit at differing precision or accuracy.
+
 One future addition to Clunk will be to add comments to the optimised IR which shows exactly what clunk did to optimise the code, making it easier for LLVM developers to write stronger optimisation passes.
 
 ## Features
@@ -155,6 +168,12 @@ One future addition to Clunk will be to add comments to the optimised IR which s
 - **Interpreter-based evaluation** -- fast program evaluation with caching
   for fitness assessment during search.
 
+>[!WARNING]
+> **E-graph rewriting is an experimental pass and is only intended for small-scale programs.**
+>
+> Instances where E-graphs return non-functional LLVM code should **NOT** be reported as a bug, as it's already a known issue.
+> It is therefore disabled by default and can be re-enabled with the `--egraph` flag.
+
 ## Building
 
 ### Requirements
@@ -178,11 +197,13 @@ ctest --output-on-failure
 | Option | Default | Description |
 |--------|---------|-------------|
 | `CLUNK_ENABLE_Z3` | ON | Enable Z3 SMT verification (runtime dlopen) |
+| `CLUNK_ENABLE_ALIVE2` | ON | Enable Alive2 code verification (runtime dlopen) |
 | `CLUNK_ENABLE_TESTS` | ON | Build test suite |
 | `CLUNK_ENABLE_BENCHMARKS` | ON | Build benchmarks |
 | `CLUNK_ENABLE_GPU` | ON | Enable GPU/PTX optimisation stubs |
 | `CLUNK_ENABLE_LTO` | ON | Link-time optimisation for Release builds |
 | `CLUNK_ENABLE_NATIVE` | OFF | Compile with `-march=native` (non-portable) |
+| `CLUNK_ENABLE_GC_SECTIONS` | ON | Compile with `-ffunction-sections -fdata-sections -Wl,--gc-sections` (more effective dead-code stripping from clunk) |
 
 ## Usage
 
@@ -194,7 +215,7 @@ clunk [options] <input.ll>
 
 | Option | Description |
 |--------|-------------|
-| `--opt-level <N>` | Optimisation aggressiveness (default: 2) |
+| `--opt-level <N>` | Optimisation aggressiveness (default: max) |
 | `--time-budget <sec>` | Wall-clock time limit for the search (default: 30s) |
 | `--output <file>` | Write optimised IR to a file |
 | `--verbose` | Increase output verbosity |

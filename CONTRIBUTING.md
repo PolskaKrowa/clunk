@@ -11,7 +11,7 @@ the whole codebase first.
 
 - CMake 3.20+
 - A C++17 compiler (GCC or Clang)
-- Optional: the Z3 shared library, for SMT verification (loaded at
+- Optional: the Z3 and Alive2 shared libraries, for SMT/code verification (loaded at
   runtime via `dlopen`, so you don't need it just to build)
 - Optional: `llvm-mca`, for MCA-based cost model work
 
