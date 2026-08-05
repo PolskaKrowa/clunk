@@ -98,50 +98,24 @@ $ █
 ; output.ll
 
 ; ModuleID = ''
-define internal i32 @double(i32 %x) {
-entry:
-  %r = shl i32 %x, 1
-  ret i32 %r
-}
-
 define i32 @caller_a() {
-entry:
-  %c = call i32 @double_if_pos.ipcp_0_5(i32 5)
-  ret i32 %c
+entry.cont.inl0:
+  ret i32 10
 }
 
 define i32 @caller_b() {
-entry:
-  %c = call i32 @double_if_pos.ipcp_0_5(i32 5)
-  ret i32 %c
+entry.cont.inl0:
+  ret i32 10
 }
 
 define i32 @main() {
-entry:
-  %a = call i32 @caller_a()
-  %b = call i32 @caller_b()
-  %s = add i32 %a, %b
-  ret i32 %s
-}
-
-define internal i32 @double_if_pos.ipcp_0_5(i32 %x) {
-entry:
-  br label %then
-then:
-  ret i32 10
+entry.cont.inl0.cont.inl0:
+  ret i32 20
 }
 ```
 
-Clunk found 2 dead functions, 1 interprocedural constant and an inlineable call site; removed 1 unreachable block; folded 1 known-constant value, a comarison and a branch, verified it against the
+Clunk rewrote the whole program to directly return the processed arithmetic within the program, verified it against the
 original with Z3 + Alive2, and rewrote the IR accordingly, All while evaluating each function with their own thread (the input program was small enough to allow for that, larger programs with many functions may assign multiple functions per thread, allowing clunk to quickly find cross-function optimisation opportunities, if any.)
-
-A Known limitation of clunk is that it's unable to pre-process arithmetical operations made within a program. LLVM-opt is known for its ability to do so, so the above program is *not* optimal.
-The "optimal" code would be to simply have `@main()` return 20, and have every preceding function before it stripped out for dead code. We're currently looking at ways for clunk to quickly step through
-the input code and find instances where a function (or a set of functions, collectively) returns a singular constant, or can be simplified to a single operation involving both a constant and a few operations.
-
-We understand that creating an optimisation step that does this to the extreme may result in some programs (especially those designed to use a specific algorithm, or a set thereof, to compute numerical constants) to simply
-contain the fully computed constant in a variable and return it, since an optimiser like this would have no idea whether a program is explicitly intended for computational stress-testing or as a single-use constant
-calculator that always returns the same value, albeit at differing precision or accuracy.
 
 One future addition to Clunk will be to add comments to the optimised IR which shows exactly what clunk did to optimise the code, making it easier for LLVM developers to write stronger optimisation passes.
 
@@ -158,7 +132,24 @@ One future addition to Clunk will be to add comments to the optimised IR which s
   for exploring equivalent program forms.
 - **Peephole pattern mining** -- automatic discovery of optimisation
   patterns using CEGIS (counter-example guided inductive synthesis).
-- **Vector synthesis** -- automatic discovery of SIMD intrinsic replacements.
+- **Hole-based progressive-deepening synthesis** -- replaces a function
+  body with a "hole" and enumerates 1-instruction, then 2, then 3 (etc.)
+  equivalents, SMT-verifying each. Finds the SHORTEST equivalent form
+  (Massalin-style enumerative superoptimisation). Complements the
+  stochastic / evolutionary phases as a deterministic,
+  completeness-bounded search.
+- **Vector synthesis** -- width-aware SIMD superoptimisation. Tries
+  AVX-512 → AVX2 → AVX → scalar in cascade order, picking the widest
+  tier that yields a verified cheaper rewrite. Performs lane
+  decomposition (splitting wide vectors into narrower ones via
+  `shufflevector`) and surrounding-code rewriting (promoting scalar
+  `load` chains into vector `load <N x T>`).
+- **Algorithmic preprocessor** -- module-level pre-pass that walks the
+  call graph and detects functions (or compositions of functions) whose
+  output is a predictable closed form (`f(x) ≡ C`, `f(x) ≡ c·x`,
+  `f(x) ≡ c·x + b`). When a pattern is detected and SMT-proven, the
+  function's body is rewritten to the minimal closed form, shrinking
+  the work the per-function pipeline has to do.
 - **Loop optimisation** -- loop-aware transformations and analysis.
 - **Memory optimisation** -- memory access pattern improvements.
 - **Cost model evaluation** -- TTI-based and MCA-based (llvm-mca) cost
@@ -167,6 +158,12 @@ One future addition to Clunk will be to add comments to the optimised IR which s
   analysis, liveness analysis, and kernel launch optimisation.
 - **Interpreter-based evaluation** -- fast program evaluation with caching
   for fitness assessment during search.
+- **ncurses TUI** -- an optional live progress view (`--tui`) that shows
+  every function being superoptimised in a two-panel layout: a scrollable
+  function list on the left (with live stage + improvement ratio) and a
+  detail panel on the right showing the current-best IR snapshot,
+  round/score/verified status, and elapsed time. The user can navigate
+  with ↑/↓, pin a function with Tab/p, and quit with q.
 
 >[!WARNING]
 > **E-graph rewriting is an experimental pass and is only intended for small-scale programs.**
@@ -178,6 +175,7 @@ One future addition to Clunk will be to add comments to the optimised IR which s
 > **Vector synthesis is not guaranteed to generate optimal vectorised code from scalar inputs**
 >
 > Code vectorisation is a very difficult task even for computers to perform efficiently and effectively for large operation spaces.
+> The width-cascade pass (AVX-512 → AVX2 → AVX → scalar) covers the common cases — including lane decomposition for too-wide inputs and surrounding-code rewriting (scalar `load` → vector `load <N x T>`) — but it is conservative: it only fires when the cost model says the rewrite is strictly cheaper AND SMT proves equivalence.
 > If at any point you notice clunk generating vectorised code that ends up being slower than the original, or if clunk misses an opportunity
 > to create viable and performant vector code in comparison to a scalar equivalent, Please open an issue describing the exact function that was
 > processed (or should've been processed) by clunk and what clunk has generated as its "ideal output".
@@ -190,6 +188,9 @@ One future addition to Clunk will be to add comments to the optimised IR which s
 - A C++17 compiler (GCC or Clang)
 - Optional: Z3 + Alive2 shared libraries (loaded at runtime)
 - Optional: llvm-mca (for MCA-based cost model)
+- Optional: ncurses (libncurses-dev) — enables the `--tui` live progress view.
+  When not installed, clunk builds without TUI support; `--tui` then prints a
+  warning and runs without the TUI.
 
 ### Build instructions
 
@@ -212,6 +213,7 @@ ctest --output-on-failure
 | `CLUNK_ENABLE_LTO` | ON | Link-time optimisation for Release builds |
 | `CLUNK_ENABLE_NATIVE` | OFF | Compile with `-march=native` (non-portable) |
 | `CLUNK_ENABLE_GC_SECTIONS` | ON | Compile with `-ffunction-sections -fdata-sections -Wl,--gc-sections` (more effective dead-code stripping from clunk) |
+| `CLUNK_ENABLE_TUI` | auto | Build with ncurses TUI support (`--tui` flag). Auto-detected; forced OFF when ncurses is not found. |
 
 ## Usage
 
@@ -235,6 +237,10 @@ clunk [options] <input.ll>
 | `--no-gpu` | Disable GPU/PTX passes |
 | `--no-miner` | Disable peephole miner |
 | `--no-vector-synth` | Disable vector synthesis |
+| `--no-hole-synth` | Disable hole-based progressive-deepening synthesis |
+| `--no-algo-preprocessor` | Disable module-level algorithmic preprocessor |
+| `--vector-width <tier>` | Widest vector tier to attempt: `avx512`, `avx2`, `avx`, or `auto` (default: auto) |
+| `--tui` | Launch an ncurses TUI showing live superoptimiser progress (function list + current-best IR preview). Keys: ↑/↓ nav, Tab/p pin, r toggle raw IR, q quit. |
 | `--mca` | Enable MCA-based cost model ranking |
 
 ## Project Structure
@@ -244,10 +250,11 @@ clunk/
   CMakeLists.txt          -- Top-level build configuration
   cmake/                  -- CMake modules (ClunkOpt, ClunkConfig)
   src/
-    cli/                  -- Command-line interface
+    cli/                  -- Command-line interface + ncurses TUI (tui.cpp)
     IR/                   -- LLVM IR data structures and utilities
     Analysis/             -- Program analyses (known bits, dataflow)
-    Search/               -- Search strategies, SMT verifier, e-graphs, mining
+    Search/               -- Search strategies, SMT verifier, e-graphs, mining,
+                             hole-synth, algo-preprocessor
     Evaluator/            -- Cost models, interpreter, evaluation engine
     GPU/                  -- PTX emitter, occupancy, divergence, liveness
     Pattern/              -- Pattern library management

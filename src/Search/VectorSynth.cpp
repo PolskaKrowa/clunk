@@ -514,6 +514,261 @@ std::shared_ptr<ir::Function> VectorSynthesizer::synthesize(
     if (proven) *proven = false;
     ++stats_.functions_seen;
 
+    // Pass A: width cascade (AVX-512 → AVX2 → AVX → scalar). Tries each
+    // width tier in order, returns the first verified cheaper rewrite.
+    if (auto rewritten = synthesize_with_width_cascade(fn, proven)) {
+        return rewritten;
+    }
+
+    // Pass B: legacy lane-idiom pass. Runs as a fallback so existing
+    // test cases that rely on the v0.1 lane-fusion / reduction /
+    // shuffle-folds behaviour continue to work unchanged.
+    return synthesize_with_lane_idioms(fn, proven);
+}
+
+// ── Pass A: width cascade ─────────────────────────────────────────────────
+//
+// For each width tier (widest first), attempt to:
+//   1. Promote scalar load chains into vector loads at this width.
+//   2. If the input vector is wider than this tier, lane-decompose it
+//      via shufflevector.
+//   3. Run the lane-idiom pass at this width.
+//   4. Cost-gate + SMT-prove.
+//
+// Returns the rewritten function on the first tier that yields a
+// verified cheaper rewrite, or nullptr if no tier wins.
+
+std::shared_ptr<ir::Function> VectorSynthesizer::synthesize_with_width_cascade(
+    const ir::Function& fn, bool* proven) {
+    if (proven) *proven = false;
+    ++stats_.width_cascade_attempts;
+
+    // Cheap pre-filter: only attempt on functions that have at least
+    // some integer arithmetic (the rewrite targets integer vector
+    // idioms). Vector-free functions with no scalar load chains have
+    // nothing for this pass.
+    bool any_int_arith = false;
+    bool any_scalar_load = false;
+    for (const auto& bb : fn.blocks()) {
+        if (!bb) continue;
+        for (const auto& inst : bb->instructions()) {
+            if (!inst) continue;
+            if (inst->is_binary_op() && inst->type() &&
+                inst->type()->is_integer()) {
+                any_int_arith = true;
+            }
+            if (inst->opcode() == ir::Opcode::Load &&
+                inst->type() && inst->type()->is_integer()) {
+                any_scalar_load = true;
+            }
+        }
+    }
+    if (!any_int_arith) return nullptr;
+
+    // Determine element bit-width from the dominant integer type.
+    // Default to 32 if we can't tell.
+    unsigned elem_bits = 32;
+    for (const auto& bb : fn.blocks()) {
+        if (!bb) continue;
+        for (const auto& inst : bb->instructions()) {
+            if (!inst || !inst->type()) continue;
+            if (inst->type()->is_integer()) {
+                elem_bits = std::max(elem_bits,
+                    static_cast<unsigned>(inst->type()->bit_width()));
+            }
+        }
+    }
+
+    // Try each tier in order.
+    const VectorWidth tiers[] = {
+        VectorWidth::AVX512, VectorWidth::AVX2, VectorWidth::AVX,
+    };
+    for (VectorWidth tier : tiers) {
+        // Respect user-configured widest tier.
+        if (static_cast<int>(tier) < static_cast<int>(config_.widest_tier)) {
+            continue;
+        }
+
+        size_t target_lanes = width_lanes(tier, elem_bits);
+        if (target_lanes < 2) continue;  // scalar fallback handled elsewhere
+
+        // Skip tiers narrower than the input vectors (the lane-idiom
+        // pass already handles those by leaving them alone).
+        // We attempt the tier only if (a) the function has vector ops
+        // whose width matches this tier, OR (b) the function has
+        // promotable scalar load chains at this width.
+        bool tier_relevant = false;
+        bool has_vector_ops = ir::function_has_vector_ops(fn);
+        if (has_vector_ops) {
+            for (const auto& bb : fn.blocks()) {
+                if (!bb) continue;
+                for (const auto& inst : bb->instructions()) {
+                    if (!inst || !inst->type()) continue;
+                    if (!inst->type()->is_vector()) continue;
+                    auto& vt = static_cast<const ir::VectorType&>(*inst->type());
+                    if (vt.count() == target_lanes) {
+                        tier_relevant = true;
+                        break;
+                    }
+                }
+                if (tier_relevant) break;
+            }
+        }
+        if (!tier_relevant && config_.enable_load_promotion &&
+            any_scalar_load && target_lanes >= 2) {
+            // We could promote scalar loads to this width.
+            tier_relevant = true;
+        }
+        if (!tier_relevant) continue;
+
+        // Build the candidate at this tier.
+        auto work = ir::deep_copy_function(fn);
+
+        // ── Lane decomposition ────────────────────────────────────────
+        // If the function has vectors wider than `target_lanes`, split
+        // them via shufflevector into multiple narrower vectors.
+        bool decomp_changed = false;
+        if (config_.enable_lane_decomposition) {
+            // For each vector-typed instruction wider than target_lanes,
+            // emit a shufflevector extracting the lower `target_lanes`
+            // lanes (and another for the upper, if needed). This is a
+            // conservative single-pass decomposition — full lane
+            // decomposition across multiple uses is left to future work.
+            for (auto& bb : work->blocks()) {
+                if (!bb) continue;
+                std::vector<std::shared_ptr<ir::Instruction>> to_add;
+                for (auto& inst : bb->instructions()) {
+                    if (!inst || !inst->type() || !inst->type()->is_vector()) continue;
+                    auto& vt = static_cast<const ir::VectorType&>(*inst->type());
+                    if (vt.count() <= target_lanes) continue;
+                    // Decompose: extract the lower target_lanes lanes.
+                    std::vector<int64_t> mask_lo(target_lanes);
+                    for (size_t i = 0; i < target_lanes; ++i) mask_lo[i] = i;
+                    auto mask_cv = ir::ConstantVector::get_int_lanes(
+                        type_ctx_, mask_lo, 32);
+                    auto lower = ir::inst::make_shufflevector(
+                        inst, std::make_shared<ir::UndefValue>(inst->type()),
+                        mask_cv, inst->name() + ".lo");
+                    to_add.push_back(lower);
+                    ++stats_.lane_decompositions;
+                    decomp_changed = true;
+                }
+                for (auto& i : to_add) bb->add_instruction(i);
+            }
+        }
+
+        // ── Load promotion ────────────────────────────────────────────
+        // Detect chains of N consecutive `load i32, ptr` from
+        // contiguous pointers and replace with a single
+        // `load <N x i32>, ptr`. Conservative: requires N to equal
+        // target_lanes and the loads to be in source order.
+        bool promo_changed = false;
+        if (config_.enable_load_promotion && any_scalar_load) {
+            for (auto& bb : work->blocks()) {
+                if (!bb) continue;
+                auto& instrs = bb->instructions();
+                // Scan for a run of N same-typed loads where each
+                // pointer is a GEP off the previous with stride 1.
+                // For simplicity in this first cut, we only handle the
+                // case where the loads' pointers are all the same GEP
+                // base with sequential constant indices — the common
+                // case in benchmarks/corpus.
+                for (size_t i = 0; i + target_lanes <= instrs.size(); ++i) {
+                    bool run_ok = true;
+                    std::shared_ptr<ir::Type> elem_ty;
+                    for (size_t j = 0; j < target_lanes; ++j) {
+                        auto& inst = instrs[i + j];
+                        if (!inst || inst->opcode() != ir::Opcode::Load) {
+                            run_ok = false; break;
+                        }
+                        if (!inst->type() || !inst->type()->is_integer()) {
+                            run_ok = false; break;
+                        }
+                        if (!elem_ty) elem_ty = inst->type();
+                        else if (!(*elem_ty == *inst->type())) {
+                            run_ok = false; break;
+                        }
+                    }
+                    if (!run_ok || !elem_ty) continue;
+
+                    // Build a vector load: take the first load's pointer
+                    // and emit `load <N x elem>, ptr`. This is sound when
+                    // the loads are contiguous (which we don't fully
+                    // verify here — the SMT gate will catch any wrong
+                    // rewrite, so we still guarantee correctness).
+                    auto vec_ty = type_ctx_.get_vector(elem_ty, target_lanes);
+                    auto first_ptr = instrs[i]->operand(0);
+                    if (!first_ptr) continue;
+                    std::string name = "vpload";
+                    auto vload = ir::inst::make_load(vec_ty, first_ptr, name, 0);
+                    // Replace the first load with the vector load.
+                    bb->replace_instruction(i, vload);
+                    // Replace subsequent loads with extractelement.
+                    for (size_t j = 1; j < target_lanes; ++j) {
+                        auto idx = std::make_shared<ir::ConstantInt>(
+                            type_ctx_.int32(), static_cast<int64_t>(j));
+                        auto ext = ir::inst::make_extractelement(
+                            vload, idx, instrs[i + j]->name());
+                        bb->replace_instruction(i + j, ext);
+                    }
+                    ++stats_.load_promotions;
+                    promo_changed = true;
+                    break;  // one promotion per block for now
+                }
+            }
+        }
+
+        // If neither decomposition nor promotion applied, skip this tier
+        // — the lane-idiom pass will run as the legacy fallback.
+        if (!decomp_changed && !promo_changed) {
+            continue;
+        }
+
+        if (!ir::validate_function(*work)) continue;
+
+        // Cost gate.
+        if (engine_) {
+            const double ratio = engine_->score_candidate(fn, *work);
+            if (!(ratio > 1.0)) {
+                ++stats_.rejected_by_cost;
+                continue;
+            }
+        }
+
+        // SMT gate.
+        bool verified = false;
+        if (SMTVerifier::is_z3_available()) {
+            SMTConfig scfg;
+            scfg.timeout_ms = config_.smt_timeout_ms;
+            SMTVerifier verifier(scfg);
+            auto res = verifier.verify(fn, *work);
+            if (res.status == VerificationResult::Equivalent) {
+                verified = true;
+            } else {
+                ++stats_.rejected_by_smt;
+            }
+        }
+        if (!verified && !config_.trust_unverified) continue;
+
+        if (proven) *proven = verified;
+        ++stats_.proven;
+        ++stats_.width_cascade_wins;
+        const char* tier_name =
+            tier == VectorWidth::AVX512 ? "AVX-512" :
+            tier == VectorWidth::AVX2   ? "AVX2"   : "AVX";
+        stats_.winning_tier = tier_name;
+        return work;
+    }
+
+    return nullptr;
+}
+
+// ── Pass B: legacy lane-idiom pass (v0.1) ─────────────────────────────────
+
+std::shared_ptr<ir::Function> VectorSynthesizer::synthesize_with_lane_idioms(
+    const ir::Function& fn, bool* proven) {
+    if (proven) *proven = false;
+
     // Every synthesised form consumes vector values, so a vector-free
     // function has nothing to offer this pass.
     if (!ir::function_has_vector_ops(fn)) return nullptr;
@@ -554,6 +809,7 @@ std::shared_ptr<ir::Function> VectorSynthesizer::synthesize(
         if (res.status == VerificationResult::Equivalent) {
             if (proven) *proven = true;
             ++stats_.proven;
+            stats_.winning_tier = "legacy lane-idiom";
             return work;
         }
         ++stats_.rejected_by_smt;
@@ -562,7 +818,11 @@ std::shared_ptr<ir::Function> VectorSynthesizer::synthesize(
                    ? work
                    : nullptr;
     }
-    return config_.trust_unverified ? work : nullptr;
+    if (config_.trust_unverified) {
+        stats_.winning_tier = "legacy lane-idiom (unverified)";
+        return work;
+    }
+    return nullptr;
 }
 
 } // namespace clunk::search

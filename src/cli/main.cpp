@@ -24,14 +24,21 @@
 #include "clunk/Parser/IRParser.h"
 #include "clunk/Search/PeepholeMiner.h"
 
+#ifdef CLUNK_HAS_TUI
+#include "clunk/cli/TUI.h"
+#endif
+
+#include <atomic>
 #include <cstdlib>
 #include <cctype>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -55,6 +62,10 @@ struct CliOptions {
     bool no_gpu = false;
     bool no_miner = false;         // --no-miner: disable the in-loop peephole miner
     bool no_vector_synth = false;  // --no-vector-synth: disable vector-intrinsic synthesis
+    bool no_hole_synth = false;    // --no-hole-synth: disable hole-based progressive-deepening synthesis
+    bool no_algo_preprocessor = false;  // --no-algo-preprocessor: disable module-level algo pre-pass
+    std::string vector_width = "auto";  // --vector-width <avx512|avx2|avx|auto>
+    bool tui = false;             // --tui: launch the ncurses TUI
     bool use_mca = false;          // --mca: rank final candidates with llvm-mca
     bool verbose = false;
     double verbose_interval = 1.0;  // --verbose-interval: throttle seconds (0 = unthrottled)
@@ -164,6 +175,17 @@ static void print_usage(const char* prog) {
               << "  --no-gpu                  Disable GPU optimisation\n"
               << "  --no-miner                Disable the in-loop SMT-verified peephole miner\n"
               << "  --no-vector-synth         Disable SMT-verified vector-intrinsic synthesis\n"
+              << "  --no-hole-synth           Disable hole-based progressive-deepening synthesis\n"
+              << "                            (replaces fn body with a hole, enumerates 1-inst, then 2,\n"
+              << "                            then 3 ... equivalents, SMT-verifies each)\n"
+              << "  --no-algo-preprocessor    Disable module-level algorithmic preprocessor\n"
+              << "                            (detects f(x)=C, f(x)=c*x, f(x)=c*x+b, g(f(x)) collapses)\n"
+              << "  --vector-width <tier>     Widest vector tier to attempt (avx512|avx2|avx|auto)\n"
+              << "                            Default: auto (= avx512 with cascade fallback)\n"
+              << "  --tui                    Launch an ncurses TUI showing live superoptimiser\n"
+              << "                            progress (function list + current-best IR preview).\n"
+              << "                            Requires a tty; ignored (with a warning) otherwise.\n"
+              << "                            Keys: ↑/↓ nav, Tab/p pin, r toggle raw IR, q quit.\n"
               << "  --mca                     Rank final candidates by measured cycles\n"
               << "                            (llc + llvm-mca; ignored when not installed)\n"
               << "  --verbose                 Verbose output\n"
@@ -300,6 +322,19 @@ static CliOptions parse_args(int argc, char* argv[]) {
             opts.no_miner = true;
         } else if (arg == "--no-vector-synth") {
             opts.no_vector_synth = true;
+        } else if (arg == "--no-hole-synth") {
+            opts.no_hole_synth = true;
+        } else if (arg == "--no-algo-preprocessor") {
+            opts.no_algo_preprocessor = true;
+        } else if (arg == "--vector-width") {
+            if (i + 1 < argc) {
+                opts.vector_width = argv[++i];
+            } else {
+                std::cerr << "Error: --vector-width requires an argument\n";
+                opts.show_help = true;
+            }
+        } else if (arg == "--tui") {
+            opts.tui = true;
         } else if (arg == "--mca") {
             opts.use_mca = true;
             opts.use_mca_explicitly_set = true;
@@ -749,6 +784,34 @@ int main(int argc, char* argv[]) {
     config.enable_launch_opt = !opts.no_gpu;
     config.enable_peephole_miner = !opts.no_miner;
     config.enable_vector_synth = !opts.no_vector_synth;
+    config.enable_hole_synth = !opts.no_hole_synth;
+    config.enable_algo_preprocessor = !opts.no_algo_preprocessor;
+
+    // ── Vector width tier ─────────────────────────────────────────────
+    // Parse --vector-width into VectorSynthConfig.widest_tier. "auto"
+    // (default) means try every tier starting from AVX-512 and fall back
+    // to narrower tiers when wider ones don't yield a win.
+    {
+        std::string vw = opts.vector_width;
+        // Case-insensitive comparison.
+        std::string lower_vw;
+        lower_vw.reserve(vw.size());
+        for (char c : vw) lower_vw.push_back(
+            static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+        if (lower_vw == "auto" || lower_vw.empty()) {
+            config.vector_synth_config.widest_tier = clunk::search::VectorWidth::AVX512;
+        } else if (lower_vw == "avx512" || lower_vw == "avx-512") {
+            config.vector_synth_config.widest_tier = clunk::search::VectorWidth::AVX512;
+        } else if (lower_vw == "avx2" || lower_vw == "avx-2") {
+            config.vector_synth_config.widest_tier = clunk::search::VectorWidth::AVX2;
+        } else if (lower_vw == "avx" || lower_vw == "avx-1" || lower_vw == "avx1") {
+            config.vector_synth_config.widest_tier = clunk::search::VectorWidth::AVX;
+        } else {
+            std::cerr << "Error: --vector-width must be one of: "
+                         "avx512, avx2, avx, auto\n";
+            opts.show_help = true;
+        }
+    }
     config.use_mca_ranker = opts.use_mca;
     config.verbose = opts.verbose;
     config.verbose_interval_seconds = opts.verbose_interval;
@@ -977,7 +1040,79 @@ int main(int argc, char* argv[]) {
                   << " target=" << config.target_arch.name << " ...\n";
     }
 
-    auto result = pipeline.run(*module);
+    // ── Run the pipeline, optionally under the TUI ──────────────────────
+    // When --tui is passed:
+    //   - Launch the pipeline on a worker thread.
+    //   - Install the TUI's rich progress callback on the pipeline.
+    //   - Run the TUI's render loop on the main thread.
+    //   - When the worker joins, mark the TUI as "done" so the user
+    //     can inspect the final state and press q to exit.
+    //
+    // Without --tui (or when the TUI can't be initialised — e.g. stdin
+    // isn't a tty), fall back to the synchronous path: just call
+    // pipeline.run(*module) directly.
+    clunk::PipelineResult result;
+#ifdef CLUNK_HAS_TUI
+    if (opts.tui) {
+        // The TUI owns ncurses state; the pipeline must NOT print to
+        // stderr/stdout while it's running, or the output will corrupt
+        // the screen. Suppress verbose during the TUI run.
+        config.verbose = false;
+        pipeline.config() = config;
+
+        clunk::cli::TUI tui;
+        if (!tui.init()) {
+            std::cerr << "Warning: --tui could not initialise ncurses "
+                         "(not a tty?) — falling back to non-TUI mode.\n";
+            result = pipeline.run(*module);
+        } else {
+            // Install the TUI's rich progress callback.
+            pipeline.set_rich_progress_callback(tui.make_callback());
+
+            // Run the pipeline on a worker thread.
+            std::atomic<bool> pipeline_running{true};
+            std::thread worker([&]() {
+                try {
+                    result = pipeline.run(*module);
+                } catch (...) {
+                    // Swallow — the main thread will see pipeline_running
+                    // go false and report the failure.
+                }
+                pipeline_running = false;
+            });
+
+            // Run the TUI render loop on the main thread.
+            tui.run_loop(pipeline_running);
+
+            // If the user pressed q before the pipeline finished, wait
+            // for the worker to drain (the pipeline's time budget will
+            // expire on the next round). Detach is unsafe (the captured
+            // references would dangle), so join unconditionally.
+            if (worker.joinable()) worker.join();
+
+            // Mark the TUI as done so it shows the final state.
+            std::ostringstream summary;
+            summary << "Functions processed: " << result.total_functions_processed
+                    << "  Optimised: " << result.total_optimised
+                    << "  Avg improvement: " << result.avg_improvement << "x"
+                    << "  Total time: " << result.total_time_ms << " ms";
+            tui.mark_done(summary.str());
+
+            // Render one final frame so the user sees the "done" state,
+            // then wait for them to press q to exit.
+            std::atomic<bool> dummy_running{false};
+            tui.run_loop(dummy_running);
+        }
+    } else {
+        result = pipeline.run(*module);
+    }
+#else
+    if (opts.tui) {
+        std::cerr << "Warning: --tui requested but ncurses was not available "
+                     "at build time — running without the TUI.\n";
+    }
+    result = pipeline.run(*module);
+#endif
 
     // ── Output the optimised module ─────────────────────────────────────
     if (result.optimised_module) {

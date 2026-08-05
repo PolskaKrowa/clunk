@@ -39,6 +39,9 @@
 #include "clunk/Search/PeepholeMiner.h"
 #include "clunk/Search/EgraphRewriter.h"
 #include "clunk/Search/RewriteCache.h"
+#include "clunk/Search/VectorSynth.h"
+#include "clunk/Search/HoleSynth.h"
+#include "clunk/Search/AlgoPreprocessor.h"
 #include "clunk/Pattern/PatternLibrary.h"
 #include "clunk/IR/StrengthReduce.h"
 
@@ -236,7 +239,14 @@ struct PipelineConfig {
     // model AND an SMT equivalence proof (the verifier lane-blasts vector
     // functions via ir::Scalarizer). Default ON at opt_level >= 2; inert
     // on vector-free functions.
+    //
+    // The pass now ALSO runs a width-cascade pre-pass that tries
+    // AVX-512 → AVX2 → AVX → scalar in order, picking the widest tier
+    // that yields a verified cheaper rewrite. Lane decomposition and
+    // surrounding-code rewriting (scalar load → vector load) are applied
+    // at each tier. See VectorSynth.h for the full design.
     bool enable_vector_synth = true;
+    search::VectorSynthConfig vector_synth_config;
 
     // ── Equality-saturation candidate generation ─────────────────────
     // When true, the pipeline runs a new egraph_phase() before the mining
@@ -247,6 +257,30 @@ struct PipelineConfig {
     // pattern-ordering problem for free. Default OFF (the pattern library
     // must be non-empty for this to be useful).
     bool enable_egraph_phase = false;
+
+    // ── Hole-based progressive-deepening synthesis (Massalin-style) ───────
+    // When true, run_on_function runs a hole_synth_phase() each round:
+    // it replaces the function body with a "hole" and enumerates
+    // candidate fillings in order of increasing size (1 instruction,
+    // then 2, then 3, ...), SMT-verifying each. The first verified
+    // candidate that scores strictly cheaper than the original is
+    // returned. Complements the stochastic / evolutionary phases — a
+    // deterministic, completeness-bounded search that finds the
+    // SHORTEST equivalent form. Default ON at opt_level >= 2; inert
+    // on functions outside its scope (multi-block, FP, >4 args, etc.).
+    bool enable_hole_synth = true;
+    search::HoleSynthConfig hole_synth_config;
+
+    // ── Algorithmic preprocessor (module-level pre-pass) ─────────────────
+    // When true, Pipeline::run() invokes AlgoPreprocessor on the module
+    // BEFORE per-function superoptimisation: it walks the call graph and
+    // detects functions (or compositions of functions) whose output is a
+    // predictable closed form (constant, c*x, c*x+b). When a pattern is
+    // detected and SMT-proven, the function's body is rewritten to the
+    // minimal closed form, shrinking the work the per-function pipeline
+    // has to do. Default ON at opt_level >= 2.
+    bool enable_algo_preprocessor = true;
+    search::AlgoPreConfig algo_pre_config;
 
     // ── STOKE-style stochastic search moves ────────────────────────────
     // When true, the stochastic search may use the unsound STOKE-style
@@ -365,6 +399,45 @@ using ProgressCallback = std::function<void(const std::string& stage,
                                              const std::string& function_name,
                                              double progress)>;
 
+// ── Rich progress event (for the TUI / machine consumers) ────────────────
+//
+// A richer progress event that includes the current best IR snapshot,
+// the round number, and per-stage stats. The pipeline emits these
+// alongside the simple ProgressCallback above (the legacy callback
+// stays for backward compat). Consumers that need the IR — like the
+// ncurses TUI — subscribe via set_rich_progress_callback().
+struct RichProgressEvent {
+    std::string stage;            // "patterns", "inline", "round", "vector",
+                                  // "hole", "algo-pre", "mem", "prune",
+                                  // "pow2", "mining", "egraph", "verify",
+                                  // "done", "pipeline", "skip", "cap"
+    std::string function_name;    // function being processed
+    double progress = 0.0;        // 0..1 (module-level fraction)
+
+    // ── Current best snapshot ───────────────────────────────────────────
+    // The IR text of the current best function (i.e. the baseline the
+    // search is mutating from in this round). Empty when the stage
+    // doesn't update the baseline (e.g. "pipeline" / "skip").
+    std::string current_best_ir;
+
+    // ── Round / improvement counters ────────────────────────────────────
+    size_t round = 0;             // refinement round (0-indexed)
+    size_t improvements_adopted = 0;
+    double score_original = 0.0;
+    double score_current = 0.0;
+    double improvement_ratio = 1.0;
+    bool verified = false;        // was the current best SMT-verified?
+
+    // ── Stage-specific message (human-readable) ────────────────────────
+    // e.g. "vector: synthesised 4 vector op(s)" or "mining: 3 slice(s) proved".
+    std::string message;
+
+    // ── Elapsed time so far on this function (ms) ──────────────────────
+    double elapsed_ms = 0.0;
+};
+
+using RichProgressCallback = std::function<void(const RichProgressEvent&)>;
+
 // ── The Pipeline ────────────────────────────────────────────────────────
 class Pipeline final {
 public:
@@ -378,6 +451,14 @@ public:
 
     // Set progress callback
     void set_progress_callback(ProgressCallback cb) { progress_cb_ = std::move(cb); }
+
+    // Set rich progress callback (for TUI / machine consumers).
+    // The rich callback fires on the same stages as the simple
+    // callback, but includes the current best IR snapshot and per-stage
+    // stats. Both callbacks can be set simultaneously.
+    void set_rich_progress_callback(RichProgressCallback cb) {
+        rich_progress_cb_ = std::move(cb);
+    }
 
     // Access sub-components
     evaluator::EvaluationEngine& evaluation_engine() { return eval_engine_; }
@@ -408,6 +489,7 @@ private:
         uint64_t last_mem_hash = 0;     // mem-opt guard, reset per fn
         uint64_t last_prune_hash = 0;   // dataflow-prune guard, reset per fn
         uint64_t last_pow2_hash = 0;    // pow2 strength-reduce guard, reset per fn
+        uint64_t last_hole_hash = 0;    // hole-synth guard, reset per fn
         // Rejected-candidate cache: structural hashes of candidates
         // that were SMT-rejected this round-chain. Prevents re-proposing
         // and re-rejecting the same candidate on unchanged baselines.
@@ -463,6 +545,17 @@ private:
     std::vector<search::Candidate> vector_phase(const ir::Function& fn,
                                                  Searchers& s);
 
+    // ── Hole-based progressive-deepening synthesis phase ───────────────
+    // Runs HoleSynthesizer on the current baseline: replaces the
+    // function body with a "hole" and enumerates 1-instruction, then
+    // 2-instruction, then 3-instruction equivalents, SMT-verifying
+    // each. Returns the first verified cheaper candidate. The
+    // candidate carries `sound = proven` (verified rewrites are
+    // sound-by-construction once SMT says Equivalent). Guarded by
+    // last_hole_hash — a given baseline is synthesised at most once.
+    std::vector<search::Candidate> hole_synth_phase(const ir::Function& fn,
+                                                     Searchers& s);
+
     // ── Loop-optimisation phase ──────────────────────────────────────────
     // LICM + constant-trip full unrolling of the current baseline. Both
     // rewrites are exact by construction (Candidate::sound = true); the
@@ -513,6 +606,12 @@ private:
                           const std::string& fn_name,
                           double progress);
 
+    // Fire a rich progress event (for TUI / machine consumers).
+    // The simple progress callback (if set) is also fired with the
+    // event's stage/name/progress fields, so existing stderr prints
+    // keep working.
+    void report_rich_progress(const RichProgressEvent& ev);
+
     // ── Verbose-output throttling ─────────────────────────────────────
     // Gate for every per-round `if (config_.verbose) { std::cerr << ... }`
     // diagnostic site: returns true at most once every
@@ -534,6 +633,7 @@ private:
     Searchers searchers_;              // shared sequential search state
     pattern::PatternLibrary pattern_lib_;
     ProgressCallback progress_cb_;
+    RichProgressCallback rich_progress_cb_;
     std::mutex progress_mutex_;        // guards progress_cb_ across workers
 
     // Last-emitted timestamp per "stage|fn_name" key, for

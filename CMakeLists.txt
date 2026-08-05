@@ -68,6 +68,8 @@ set(CLUNK_SOURCES
     src/Search/AliveVerifier.cpp
     src/Search/PeepholeMiner.cpp
     src/Search/VectorSynth.cpp
+    src/Search/HoleSynth.cpp
+    src/Search/AlgoPreprocessor.cpp
     src/Search/LoopOpt.cpp
     src/Search/MemOpt.cpp
     src/Search/Inliner.cpp
@@ -90,6 +92,41 @@ if(CLUNK_ENABLE_GPU)
         src/GPU/OccupancyModel.cpp
     )
     add_compile_definitions(CLUNK_HAS_GPU=1)
+endif()
+
+# ── ncurses (optional, for the --tui live progress view) ────────────────────
+# Use CMake's built-in FindCurses module — it handles both pkg-config
+# and manual search, and normalises the variables correctly (the
+# previous hand-rolled detection used NCURSES_LIBRARY singular, which
+# pkg_check_modules doesn't set — it sets NCURSES_LIBRARIES plural —
+# so target_link_libraries got an empty string and the link failed).
+#
+# We set CURSES_NEED_WIDE=TRUE so FindCurses prefers the wide-character
+# variant (ncursesw) when available — needed for proper UTF-8 support
+# in the TUI chrome, and also avoids the non-wide libcurses.so linker
+# script which references libncurses.so.6 (non-wide) that may not exist
+# on systems that only ship the wide runtime.
+#
+# find_package(Curses) sets:
+#   CURSES_FOUND          - TRUE if curses was found
+#   CURSES_INCLUDE_DIR    - the curses include directory (singular, a path)
+#   CURSES_LIBRARIES      - the curses libraries (a list, e.g. "ncursesw;tinfo")
+#   CURSES_NCURSES_LIBRARY - the ncurses library path (if found)
+set(CURSES_NEED_WIDE TRUE)
+find_package(Curses QUIET)
+if(CURSES_FOUND)
+    option(CLUNK_ENABLE_TUI "Enable the ncurses TUI (--tui flag)" ON)
+else()
+    set(CLUNK_ENABLE_TUI OFF CACHE BOOL "Enable the ncurses TUI" FORCE)
+endif()
+if(CLUNK_ENABLE_TUI)
+    add_compile_definitions(CLUNK_HAS_TUI=1)
+    # Export the ncurses paths for tests/CMakeLists.txt to reuse.
+    set(CLUNK_NCURSES_INCLUDE_DIR ${CURSES_INCLUDE_DIR} CACHE INTERNAL "ncurses include dir")
+    set(CLUNK_NCURSES_LIBRARIES ${CURSES_LIBRARIES} CACHE INTERNAL "ncurses libraries")
+    message(STATUS "ncurses TUI: ENABLED (include=${CURSES_INCLUDE_DIR}, libs=${CURSES_LIBRARIES})")
+else()
+    message(STATUS "ncurses TUI: DISABLED (ncurses not found)")
 endif()
 
 # ── Optional build optimisations ────────────────────────────────────────────
@@ -128,9 +165,17 @@ endif()
 target_compile_options(clunk_core PRIVATE -Wall -Wextra -Wpedantic)
 
 # ── CLI executable ───────────────────────────────────────────────────────────
-add_executable(clunk src/cli/main.cpp)
+set(CLUNK_CLI_SOURCES src/cli/main.cpp)
+if(CLUNK_ENABLE_TUI)
+    list(APPEND CLUNK_CLI_SOURCES src/cli/tui.cpp)
+endif()
+add_executable(clunk ${CLUNK_CLI_SOURCES})
 target_link_libraries(clunk PRIVATE clunk_core)
 target_compile_options(clunk PRIVATE -Wall -Wextra -Wpedantic)
+if(CLUNK_ENABLE_TUI)
+    target_include_directories(clunk PRIVATE ${CLUNK_NCURSES_INCLUDE_DIR})
+    target_link_libraries(clunk PRIVATE ${CLUNK_NCURSES_LIBRARIES})
+endif()
 
 # ── CMake integration package ───────────────────────────────────────────────
 include(CMakePackageConfigHelpers)

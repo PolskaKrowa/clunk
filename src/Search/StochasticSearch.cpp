@@ -1029,7 +1029,9 @@ bool StochasticSearch::passes_test_vectors(const ir::Function& original,
         auto orig_result = evaluator::Interpreter::interpret(original, args);
         if (!orig_result) {
             // Original is unsupported — skip the filter (don't penalise
-            // candidates for the original's limitations).
+            // candidates for the original's limitations). The candidate
+            // will still go through SMT (or the trust_unverified gate in
+            // verify_and_select, which has its own soundness check).
             return true;
         }
         auto cand_result = evaluator::Interpreter::interpret(candidate, args);

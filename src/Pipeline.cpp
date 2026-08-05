@@ -31,6 +31,7 @@
 #include <unordered_set>
 
 #include "clunk/Evaluator/CostModel.h"
+#include "clunk/Evaluator/Interpreter.h"
 #include "clunk/IR/Clone.h"
 #include "clunk/IR/DataflowPrune.h"
 #include "clunk/IR/LoopAnalysis.h"
@@ -226,14 +227,131 @@ PipelineResult Pipeline::run(const ir::Module& module) {
         }
     }
 
-    // Functions to process, in module order (independent — safe to optimise in
-    // parallel). Results are indexed by position so the output module keeps
-    // module order regardless of completion order.
-    // NOTE: we iterate the work_module (post-cross-function-passes), NOT
-    // the original `module` — IPCP/DFE may have added/removed functions.
+    // ── Module-level pre-pass: algorithmic preprocessor ──────────────
+    // Walks the call graph and detects functions (or compositions of
+    // functions) whose output is a predictable closed form (constant,
+    // c*x, c*x+b). When a pattern is detected and SMT-proven, the
+    // function's body is rewritten to the minimal closed form —
+    // shrinking the work the per-function pipeline has to do.
+    if (config_.enable_algo_preprocessor && config_.opt_level >= 2) {
+        search::AlgoPreConfig acfg = config_.algo_pre_config;
+        if (config_.smt_config.timeout_ms > 0)
+            acfg.smt_timeout_ms = config_.smt_config.timeout_ms;
+        acfg.trust_unverified = config_.trust_unverified ||
+                                config_.skip_smt ||
+                                !search::SMTVerifier::is_z3_available();
+        search::AlgoPreprocessor ap(acfg);
+        bool achanged = ap.run(*work_module);
+        if (achanged && config_.verbose) {
+            const auto& st = ap.stats();
+            std::cerr << "  [algo-pre] scanned " << st.functions_scanned
+                      << " function(s); detected "
+                      << st.constants_detected << " constant(s), "
+                      << st.scalars_detected << " multiplicative, "
+                      << st.affines_detected << " affine, "
+                      << st.compositions_detected << " composition collapse(s); "
+                      << st.rewrites_proven << " proven\n";
+        }
+    }
+
+    // ── Module-level pre-pass: constant folding ──────────────────────
+    // Run prune_dataflow (DCE + known-bits constant/branch folding +
+    // unreachable-block elimination) on EVERY function in the module
+    // BEFORE any per-function processing. This is critical for IPCP
+    // clones: IPCP substitutes constant arguments into a clone, but
+    // doesn't fold the resulting constant expressions. Without this
+    // pass, a caller's inliner sees the un-folded multi-block callee
+    // (e.g. `icmp sge 5, 0; br; mul 5, 2; ret; ret 0`) and rejects it
+    // via the cost gate. With this pass, the callee is pre-folded to
+    // `ret 10`, and the caller's inliner can inline it trivially.
+    //
+    // Sound by construction (prune_dataflow is exact). Runs at most
+    // 3 iterations per function to reach a fixpoint.
+    if (config_.opt_level >= 2) {
+        size_t total_folded = 0, total_branches = 0, total_blocks = 0;
+        for (auto& fn : work_module->functions()) {
+            if (!fn) continue;
+            for (int iter = 0; iter < 3; ++iter) {
+                ir::PruneStats stats;
+                auto pruned = ir::prune_dataflow(*fn, &stats);
+                if (!pruned) break;
+                // Replace the function's body with the pruned version.
+                auto& blocks = const_cast<std::vector<std::shared_ptr<ir::BasicBlock>>&>(
+                    fn->blocks());
+                blocks.clear();
+                for (auto& bb : pruned->blocks()) {
+                    if (!bb) continue;
+                    auto& nb = fn->add_block(bb->name());
+                    for (auto& inst : bb->instructions()) {
+                        if (inst) nb.add_instruction(inst);
+                    }
+                }
+                fn->rebuild_block_index();
+                fn->compute_predecessors();
+                total_folded += stats.values_folded_constant;
+                total_branches += stats.branches_simplified;
+                total_blocks += stats.blocks_removed;
+                if (stats.values_folded_constant == 0 &&
+                    stats.branches_simplified == 0 &&
+                    stats.blocks_removed == 0) break;
+            }
+        }
+        if ((total_folded > 0 || total_branches > 0 || total_blocks > 0) &&
+            config_.verbose) {
+            std::cerr << "  [fold] module-level: folded " << total_folded
+                      << " constant(s), " << total_branches << " branch(es), "
+                      << "removed " << total_blocks << " unreachable block(s)\n";
+        }
+    }
+
+    // Functions to process. We sort by call-graph topological order
+    // (callees before callers) so that when a caller's inliner runs,
+    // its callees have already been optimised. This is critical for
+    // the cross_fn.ll pattern: `double_if_pos.ipcp_0_5` (the IPCP
+    // clone) must be folded to `ret 10` BEFORE `caller_a`'s inliner
+    // runs, so the inliner can inline the folded form.
+    //
+    // The call graph's SCCs are in reverse-topological order (leaves
+    // first), which is exactly what we want — process callees (leaves)
+    // before callers. We preserve module order within each SCC for
+    // determinism.
+    //
+    // NOTE: we iterate the work_module (post-cross-function-passes),
+    // NOT the original `module` — IPCP/DFE may have added/removed
+    // functions.
     std::vector<const ir::Function*> fns;
-    for (auto& fn : work_module->functions())
-        if (fn) fns.push_back(fn.get());
+    {
+        // Build the call graph on the post-pre-pass module.
+        analysis::CallGraph cg;
+        std::vector<std::string> entries;
+        for (const auto& fn : work_module->functions()) {
+            if (fn && (fn->linkage() == ir::Linkage::External ||
+                       fn->linkage() == ir::Linkage::Weak)) {
+                entries.push_back(fn->name());
+            }
+        }
+        cg.build(*work_module, entries);
+        // Map function name → Function*, for lookup after sorting.
+        std::unordered_map<std::string, const ir::Function*> fn_by_name;
+        for (auto& fn : work_module->functions()) {
+            if (fn) fn_by_name[fn->name()] = fn.get();
+        }
+        // Walk SCCs in reverse-topo order (callees first).
+        for (const auto& scc : cg.sccs()) {
+            for (const auto& name : scc.members) {
+                auto it = fn_by_name.find(name);
+                if (it != fn_by_name.end()) fns.push_back(it->second);
+            }
+        }
+        // Safety net: if the call graph missed any function (e.g.
+        // indirect calls), append them in module order.
+        for (auto& fn : work_module->functions()) {
+            if (!fn) continue;
+            if (std::find(fns.begin(), fns.end(), fn.get()) == fns.end()) {
+                fns.push_back(fn.get());
+            }
+        }
+    }
     const size_t total_fns = fns.size();
     std::vector<PipelineResult::FunctionResult> fn_results(total_fns);
 
@@ -372,6 +490,242 @@ PipelineResult Pipeline::run(const ir::Module& module) {
                                     : std::make_shared<ir::Function>(*fns[i]));
     }
 
+    // ── Post-optimisation cleanup: re-run inlining + folding ────────
+    // After per-function optimisation, callees may have been simplified
+    // (e.g. an IPCP clone folded to `ret 10`). But the inliner for
+    // callers ran BEFORE the callees were optimised (in parallel or
+    // just earlier in the sequence). This cleanup pass re-runs the
+    // inliner on the now-optimised module, so callers can inline the
+    // simplified callees. Then it re-folds to collapse the inlined
+    // constants. Repeats up to 3 times to catch multi-level call
+    // chains (main → caller_a → double_if_pos.ipcp_0_5).
+    //
+    // Sound by construction (inlining + prune_dataflow + DFE are all
+    // exact). Only runs when the multi-block inliner is enabled.
+    if (config_.enable_multiblock_inliner && config_.opt_level >= 2 &&
+        result.optimised_module->function_count() > 1) {
+        for (int cleanup_round = 0; cleanup_round < 3; ++cleanup_round) {
+            bool any_change = false;
+
+            // 1. Re-run the multi-block inliner on each function.
+            for (auto& fn : result.optimised_module->functions()) {
+                if (!fn) continue;
+                // Skip declarations.
+                if (fn->blocks().empty()) continue;
+                search::InlinerConfig mcfg;
+                mcfg.enable_multiblock = true;
+                search::Inliner mbinliner(mcfg);
+                auto inlined = mbinliner.inline_calls_multiblock(
+                    *fn, *result.optimised_module);
+                if (!inlined) continue;
+                // Cost gate: only adopt if cheaper.
+                if (eval_engine_.score_candidate(*fn, *inlined) <= 1.0) continue;
+                // Replace the function's body with the inlined version.
+                auto& blocks = const_cast<std::vector<std::shared_ptr<ir::BasicBlock>>&>(
+                    fn->blocks());
+                blocks.clear();
+                for (auto& bb : inlined->blocks()) {
+                    if (!bb) continue;
+                    auto& nb = fn->add_block(bb->name());
+                    for (auto& inst : bb->instructions()) {
+                        if (inst) nb.add_instruction(inst);
+                    }
+                }
+                fn->rebuild_block_index();
+                fn->compute_predecessors();
+                any_change = true;
+                if (config_.verbose) {
+                    std::cerr << "  [cleanup-inline] " << fn->name()
+                              << ": inlined "
+                              << mbinliner.stats().multiblock_inlined
+                              << " call site(s)\n";
+                }
+            }
+
+            // 2. Re-run prune_dataflow on each function to fold the
+            // inlined constants. Also merge blocks connected by
+            // unconditional branches (the inliner produces chains of
+            // `br label %X` blocks that need to be collapsed).
+            for (auto& fn : result.optimised_module->functions()) {
+                if (!fn) continue;
+                if (fn->blocks().empty()) continue;
+
+                // Merge blocks connected by unconditional branches.
+                // A block whose only instruction is `br label %dest`
+                // can be replaced: all predecessors that branch to it
+                // are rewritten to branch to %dest instead, then the
+                // block is removed. Iterate to a fixpoint.
+                for (int merge_iter = 0; merge_iter < 10; ++merge_iter) {
+                    bool merged_any = false;
+                    auto& blocks = const_cast<std::vector<std::shared_ptr<ir::BasicBlock>>&>(
+                        fn->blocks());
+                    // Build a map: block_name → replacement block_name
+                    // (for chains like A→B→C, A should be replaced by C).
+                    std::unordered_map<std::string, std::string> merge_map;
+                    for (auto& bb : blocks) {
+                        if (!bb || bb->size() != 1) continue;
+                        auto term = bb->terminator();
+                        if (!term || term->opcode() != ir::Opcode::Br) continue;
+                        // Unconditional branch has metadata "dest_bb".
+                        auto it = term->metadata().find("dest_bb");
+                        if (it == term->metadata().end()) continue;
+                        if (it->second == bb->name()) continue;  // self-loop
+                        merge_map[bb->name()] = it->second;
+                    }
+                    if (merge_map.empty()) break;
+                    // Resolve chains: A→B→C becomes A→C.
+                    for (auto& [from, to] : merge_map) {
+                        std::string cur = to;
+                        while (true) {
+                            auto mit = merge_map.find(cur);
+                            if (mit == merge_map.end()) break;
+                            // Check for cycles.
+                            if (mit->second == from || mit->second == to) break;
+                            cur = mit->second;
+                        }
+                        to = cur;
+                    }
+                    // Rewrite all branch targets in remaining blocks.
+                    for (auto& bb : blocks) {
+                        if (!bb) continue;
+                        for (auto& inst : bb->instructions()) {
+                            if (!inst || inst->opcode() != ir::Opcode::Br) continue;
+                            auto& md = const_cast<std::unordered_map<std::string, std::string>&>(
+                                inst->metadata());
+                            for (auto& [key, val] : md) {
+                                if (key == "dest_bb" || key == "true_bb" ||
+                                    key == "false_bb") {
+                                    auto mit = merge_map.find(val);
+                                    if (mit != merge_map.end()) {
+                                        val = mit->second;
+                                        merged_any = true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Rewrite phi node incoming blocks.
+                    for (auto& bb : blocks) {
+                        if (!bb) continue;
+                        for (auto& inst : bb->instructions()) {
+                            if (!inst || inst->opcode() != ir::Opcode::Phi) continue;
+                            auto& md = const_cast<std::unordered_map<std::string, std::string>&>(
+                                inst->metadata());
+                            auto pit = md.find("phi_blocks");
+                            if (pit == md.end()) continue;
+                            std::string new_blocks;
+                            bool changed = false;
+                            // Split comma-separated list, replace each.
+                            std::string s = pit->second;
+                            size_t start = 0;
+                            while (start < s.size()) {
+                                size_t comma = s.find(',', start);
+                                std::string token = (comma == std::string::npos)
+                                    ? s.substr(start) : s.substr(start, comma - start);
+                                // Trim whitespace.
+                                while (!token.empty() && isspace(token.front())) token.erase(0, 1);
+                                while (!token.empty() && isspace(token.back())) token.pop_back();
+                                auto mit = merge_map.find(token);
+                                if (mit != merge_map.end()) {
+                                    token = mit->second;
+                                    changed = true;
+                                }
+                                if (!new_blocks.empty()) new_blocks += ",";
+                                new_blocks += token;
+                                if (comma == std::string::npos) break;
+                                start = comma + 1;
+                            }
+                            if (changed) pit->second = new_blocks;
+                        }
+                    }
+                    // Remove the merged-away blocks.
+                    std::vector<std::string> to_remove;
+                    for (auto& bb : blocks) {
+                        if (!bb) continue;
+                        if (merge_map.count(bb->name())) {
+                            to_remove.push_back(bb->name());
+                        }
+                    }
+                    for (auto& name : to_remove) {
+                        fn->remove_block(name);
+                        any_change = true;
+                    }
+                    fn->rebuild_block_index();
+                    fn->compute_predecessors();
+                    if (!merged_any) break;
+                }
+
+                // Now run prune_dataflow to fold constants.
+                for (int iter = 0; iter < 3; ++iter) {
+                    ir::PruneStats stats;
+                    auto pruned = ir::prune_dataflow(*fn, &stats);
+                    if (!pruned) break;
+                    auto& blocks = const_cast<std::vector<std::shared_ptr<ir::BasicBlock>>&>(
+                        fn->blocks());
+                    blocks.clear();
+                    for (auto& bb : pruned->blocks()) {
+                        if (!bb) continue;
+                        auto& nb = fn->add_block(bb->name());
+                        for (auto& inst : bb->instructions()) {
+                            if (inst) nb.add_instruction(inst);
+                        }
+                    }
+                    fn->rebuild_block_index();
+                    fn->compute_predecessors();
+                    if (stats.values_folded_constant > 0 ||
+                        stats.branches_simplified > 0 ||
+                        stats.blocks_removed > 0) {
+                        any_change = true;
+                    }
+                    if (stats.values_folded_constant == 0 &&
+                        stats.branches_simplified == 0 &&
+                        stats.blocks_removed == 0) break;
+                }
+            }
+
+            // 3. Re-run DFE to remove functions that are no longer
+            // called after inlining.
+            {
+                search::CrossFnConfig xcfg;
+                xcfg.enable_dfe = true;
+                xcfg.enable_ipcp = false;
+                search::CrossFunctionPasses xpass(xcfg);
+                if (xpass.run(*result.optimised_module)) {
+                    any_change = true;
+                    if (config_.verbose) {
+                        std::cerr << "  [cleanup-dfe] removed "
+                                  << xpass.stats().dfe_removed
+                                  << " dead function(s)\n";
+                    }
+                }
+            }
+
+            if (!any_change) break;
+        }
+
+        // Update function_results with the post-cleanup versions.
+        for (auto& [name, fr] : result.function_results) {
+            auto fn = result.optimised_module->function(name);
+            if (fn && fr.optimised) {
+                fr.optimised = std::make_shared<ir::Function>(*fn);
+                fr.score_optimised = eval_engine_.analyse(*fn).score;
+                // Recompute improvement ratio.
+                if (fr.score_original != 0.0) {
+                    double so = fr.score_original, sp = fr.score_optimised;
+                    constexpr double EPS = 1e-9;
+                    if (std::abs(sp - so) < EPS) fr.improvement_ratio = 1.0;
+                    else if (so <= 0.0 && sp <= 0.0)
+                        fr.improvement_ratio = (std::abs(sp) < EPS) ? 1e6 :
+                                                std::abs(so) / std::abs(sp);
+                    else if (so >= 0.0 && sp >= 0.0)
+                        fr.improvement_ratio = (std::abs(so) < EPS) ? 1e6 :
+                                                sp / so;
+                    else fr.improvement_ratio = sp / so;
+                }
+            }
+        }
+    }
+
     auto end = std::chrono::high_resolution_clock::now();
     result.total_time_ms = std::chrono::duration<double, std::milli>(end - start).count();
     result.total_functions_processed = result.function_results.size();
@@ -478,7 +832,28 @@ PipelineResult::FunctionResult Pipeline::run_on_function(const ir::Function& fn,
     s.last_mem_hash = 0;
     s.last_prune_hash = 0;
     s.last_pow2_hash = 0;
+    s.last_hole_hash = 0;
     s.rejected_hashes.clear();
+
+    // Fire a "start" rich progress event so the TUI can mark this
+    // function as in-progress before any rounds run.
+    if (rich_progress_cb_) {
+        RichProgressEvent ev;
+        ev.stage = "start";
+        ev.function_name = fn.name();
+        ev.progress = 0.0;
+        ev.current_best_ir = fn.to_string();
+        ev.round = 0;
+        ev.improvements_adopted = 0;
+        auto orig_analysis = eval_engine_.analyse(fn);
+        ev.score_original = orig_analysis.score;
+        ev.score_current = orig_analysis.score;
+        ev.improvement_ratio = 1.0;
+        ev.verified = false;
+        ev.message = "started";
+        ev.elapsed_ms = 0.0;
+        report_rich_progress(ev);
+    }
 
     // Arm a local deadline if run_on_function() was called directly
     // (not via run(), which arms the shared one).
@@ -635,6 +1010,21 @@ PipelineResult::FunctionResult Pipeline::run_on_function(const ir::Function& fn,
                                       std::make_move_iterator(egraph_candidates.end()));
             }
 
+            // ── Hole-based progressive-deepening synthesis ─────────────
+            // Runs AFTER the mutation searches and the miner/e-graph:
+            // hole-synth is deterministic and finds the SHORTEST
+            // equivalent form, so it's the natural "last resort" when
+            // the probabilistic phases didn't find a 1-2 instruction
+            // equivalent. Skipped on the miner-only path (it's a whole-
+            // function search and needs the function small enough to
+            // enumerate).
+            if (!oversized) {
+                auto hole_candidates = hole_synth_phase(*current, s);
+                all_candidates.insert(all_candidates.end(),
+                                      std::make_move_iterator(hole_candidates.begin()),
+                                      std::make_move_iterator(hole_candidates.end()));
+            }
+
             // Stage 4: Verify against the ORIGINAL, select vs `current`
             auto best = verify_and_select(fn, *current, all_candidates, result, s);
 
@@ -654,6 +1044,38 @@ PipelineResult::FunctionResult Pipeline::run_on_function(const ir::Function& fn,
                               << ": adopted improvement"
                               << (result.verified ? " (verified)" : " (unverified)")
                               << "\n";
+                }
+                // Fire a rich progress event so the TUI (and any other
+                // machine consumer) can refresh its display with the
+                // new current-best IR snapshot.
+                if (rich_progress_cb_) {
+                    RichProgressEvent ev;
+                    ev.stage = "round";
+                    ev.function_name = fn.name();
+                    ev.progress = 1.0 - 1.0 / static_cast<double>(round + 2);
+                    ev.current_best_ir = current->to_string();
+                    ev.round = round;
+                    ev.improvements_adopted = result.improvements_adopted;
+                    ev.verified = result.verified;
+                    auto cur_analysis = eval_engine_.analyse(*current);
+                    ev.score_current = cur_analysis.score;
+                    auto orig_analysis = eval_engine_.analyse(fn);
+                    ev.score_original = orig_analysis.score;
+                    double so = orig_analysis.score, sp = cur_analysis.score;
+                    constexpr double EPS = 1e-9;
+                    if (std::abs(sp - so) < EPS) ev.improvement_ratio = 1.0;
+                    else if (so <= 0.0 && sp <= 0.0)
+                        ev.improvement_ratio = (std::abs(sp) < EPS) ? 1e6 :
+                                                std::abs(so) / std::abs(sp);
+                    else if (so >= 0.0 && sp >= 0.0)
+                        ev.improvement_ratio = (std::abs(so) < EPS) ? 1e6 :
+                                                sp / so;
+                    else ev.improvement_ratio = sp / so;
+                    ev.message = "adopted improvement";
+                    auto fn_elapsed = std::chrono::duration<double, std::milli>(
+                        std::chrono::high_resolution_clock::now() - fn_start).count();
+                    ev.elapsed_ms = fn_elapsed;
+                    report_rich_progress(ev);
                 }
             } else {
                 ++stagnant;
@@ -685,6 +1107,25 @@ PipelineResult::FunctionResult Pipeline::run_on_function(const ir::Function& fn,
     auto opt_analysis = eval_engine_.analyse(*result.optimised);
     result.score_original = orig_analysis.score;
     result.score_optimised = opt_analysis.score;
+
+    // Fire a "done" rich progress event so the TUI can show the final
+    // optimised IR for this function.
+    if (rich_progress_cb_) {
+        RichProgressEvent ev;
+        ev.stage = "done";
+        ev.function_name = fn.name();
+        ev.progress = 1.0;
+        ev.current_best_ir = result.optimised->to_string();
+        ev.round = result.rounds_run;
+        ev.improvements_adopted = result.improvements_adopted;
+        ev.score_original = result.score_original;
+        ev.score_current = result.score_optimised;
+        ev.improvement_ratio = result.improvement_ratio;
+        ev.verified = result.verified;
+        ev.message = "done";
+        ev.elapsed_ms = result.time_spent_ms;
+        report_rich_progress(ev);
+    }
 
     // Compute the improvement ratio, sign-aware.
     //
@@ -1010,7 +1451,7 @@ std::vector<search::Candidate> Pipeline::vector_phase(const ir::Function& fn,
     if (h == s.last_vector_hash) return {};
     s.last_vector_hash = h;
 
-    search::VectorSynthConfig vcfg;
+    search::VectorSynthConfig vcfg = config_.vector_synth_config;
     if (config_.smt_config.timeout_ms > 0)
         vcfg.smt_timeout_ms = config_.smt_config.timeout_ms;
     // Without a prover the pass returns rewrites only in best-effort mode
@@ -1039,6 +1480,65 @@ std::vector<search::Candidate> Pipeline::vector_phase(const ir::Function& fn,
                   << synth.stats().lane_fusions << " vector op(s), "
                   << synth.stats().reductions << " reduction intrinsic(s), "
                   << synth.stats().shuffle_folds << " shuffle fold(s)"
+                  << (proven ? " [proven]" : " [unproven]") << "\n";
+    }
+
+    std::vector<search::Candidate> out;
+    out.push_back(std::move(cand));
+    return out;
+}
+
+// ── hole_synth_phase (hole-based progressive-deepening synthesis) ───────────
+
+std::vector<search::Candidate> Pipeline::hole_synth_phase(const ir::Function& fn,
+                                                            Searchers& s) {
+    if (config_.opt_level < 2) return {};
+    if (!config_.enable_hole_synth) return {};
+    if (remaining_seconds() <= 0.05) return {};
+
+    // The synthesiser is deterministic for a given (fn, config) — run
+    // each distinct baseline at most once.
+    const uint64_t h = search::StochasticSearch::structural_hash(fn);
+    if (h == s.last_hole_hash) return {};
+    s.last_hole_hash = h;
+
+    search::HoleSynthConfig hcfg = config_.hole_synth_config;
+    if (config_.smt_config.timeout_ms > 0)
+        hcfg.smt_timeout_ms = config_.smt_config.timeout_ms;
+    // Cap the hole-synth's internal time budget at the pipeline's
+    // remaining wall-clock budget — prevents hole-synth from
+    // monopolising the round when no equivalent exists at any depth.
+    double rem = remaining_seconds();
+    if (rem > 0.0 && rem < hcfg.time_budget_seconds) {
+        hcfg.time_budget_seconds = rem;
+    }
+    // Without a prover the pass returns rewrites only in best-effort mode
+    // (they then go through verify_and_select's normal Unknown handling).
+    hcfg.trust_unverified = config_.trust_unverified ||
+                            config_.skip_smt ||
+                            !search::SMTVerifier::is_z3_available();
+
+    search::HoleSynthesizer synth(&eval_engine_, hcfg);
+    bool proven = false;
+    auto rewritten = synth.synthesize(fn, &proven);
+    if (!rewritten) return {};
+
+    search::Candidate cand;
+    cand.function = rewritten;
+    cand.score = eval_engine_.analyse(*rewritten).score;
+    cand.iteration_found = 0;
+    cand.description = proven
+        ? "hole-based progressive-deepening synthesis (SMT-verified)"
+        : "hole-based progressive-deepening synthesis (unverified)";
+    cand.structural_hash = search::StochasticSearch::structural_hash(*rewritten);
+    cand.sound = proven;
+
+    if (config_.verbose && should_log_verbose("hole", fn.name())) {
+        std::cerr << "  [hole] " << fn.name() << ": synthesised "
+                  << synth.stats().candidates_enumerated << " candidate(s), "
+                  << synth.stats().candidates_smt_verified << " SMT-checked, "
+                  << synth.stats().candidates_equivalent << " equivalent; "
+                  << "best depth = " << synth.stats().best_depth
                   << (proven ? " [proven]" : " [unproven]") << "\n";
     }
 
@@ -1389,14 +1889,77 @@ std::shared_ptr<ir::Function> Pipeline::verify_and_select(
     //      function, never against `current`, so every adopted baseline
     //      in the refinement chain is independently anchored.
     //   3. (opt-in) candidates the prover returned Unknown for.
+    //      SOUNDNESS GATE: these candidates MUST pass the test-vector
+    //      differential (the original is interpretable AND the candidate
+    //      agrees on all probes). Without this gate, `trust_unverified`
+    //      would adopt unsound rewrites on uninterpretable functions
+    //      (e.g. functions with residual calls the inliner couldn't
+    //      eliminate) — the Interpreter can't evaluate them, SMT also
+    //      returns Unknown, and there's no verification path at all.
     // Candidates PROVED NotEquivalent are never adopted, in any mode.
     bool z3_available = !config_.skip_smt &&
                         search::SMTVerifier::is_z3_available();
 
+    // Helper: is it safe to adopt `candidate` via the trust_unverified
+    // tier? Requires the Interpreter differential to pass — the original
+    // must be interpretable AND the candidate must agree on all probes.
+    // Returns false when the original is uninterpretable (the Interpreter
+    // returns nullopt), because in that case SMT also returns Unknown
+    // and there is NO verification path. Sound-by-construction candidates
+    // bypass this check (they're adopted in tier 1 regardless).
+    auto safe_for_trust_unverified = [&](const ir::Function& orig,
+                                          const std::shared_ptr<ir::Function>& cand)
+        -> bool {
+        // Probe values: a small set of "interesting" integers.
+        static const int64_t kProbe[] = {
+            0, 1, -1, 2, -2, 3, -3, 7, -7, 8, 15, 16, 17,
+            127, 128, 255, 256, 1023, 1024,
+        };
+        constexpr size_t kProbeCount = sizeof(kProbe) / sizeof(kProbe[0]);
+        size_t nargs = orig.argument_count();
+        size_t n_vectors = config_.test_vector_count > 0
+                              ? std::min(config_.test_vector_count, kProbeCount)
+                              : kProbeCount;
+
+        for (size_t i = 0; i < n_vectors; ++i) {
+            std::vector<int64_t> args(nargs, kProbe[i]);
+            for (size_t j = 1; j < nargs; ++j) {
+                args[j] = kProbe[(i + j) % kProbeCount];
+            }
+            auto orig_r = evaluator::Interpreter::interpret(orig, args);
+            if (!orig_r) {
+                // Original is uninterpretable — NO verification path.
+                // SMT also returns Unknown for functions with calls /
+                // memory / FP / loops. Reject.
+                return false;
+            }
+            auto cand_r = evaluator::Interpreter::interpret(*cand, args);
+            if (!cand_r) {
+                // Candidate is uninterpretable but original IS — the
+                // candidate introduced an unsupported op. Reject.
+                return false;
+            }
+            if (*orig_r != *cand_r) return false;
+        }
+        return true;
+    };
+
     if (!z3_available) {
-        // No prover available (or explicitly skipped): trust the evaluator.
-        result.verified = scored[0].candidate->sound;
-        return scored[0].candidate->function;
+        // No prover available (or explicitly skipped): adopt the best
+        // candidate that EITHER is sound-by-construction OR passes the
+        // test-vector differential. Unsound candidates on uninterpretable
+        // originals are rejected (no verification path exists).
+        for (auto& sc : scored) {
+            if (sc.candidate->sound) {
+                result.verified = true;
+                return sc.candidate->function;
+            }
+            if (safe_for_trust_unverified(original, sc.candidate->function)) {
+                result.verified = false;
+                return sc.candidate->function;
+            }
+        }
+        return nullptr;
     }
 
     std::shared_ptr<ir::Function> unknown_fallback;
@@ -1463,7 +2026,13 @@ std::shared_ptr<ir::Function> Pipeline::verify_and_select(
             continue;
         }
         // Unknown / Error: eligible for best-effort adoption below.
-        if (config_.trust_unverified && !unknown_fallback) {
+        // SOUNDNESS GATE: only accept as fallback if the test-vector
+        // differential passes. When the original is uninterpretable
+        // (calls / memory / FP / loops), both SMT and the Interpreter
+        // return Unknown/nullopt — there is NO verification path, and
+        // adopting would be unsound.
+        if (config_.trust_unverified && !unknown_fallback &&
+            safe_for_trust_unverified(original, sc.candidate->function)) {
             unknown_fallback = sc.candidate->function;
         }
     }
@@ -1523,6 +2092,36 @@ void Pipeline::report_progress(const std::string& stage,
         // module path, and the user's callback need not be thread-safe.
         std::lock_guard<std::mutex> lock(progress_mutex_);
         progress_cb_(stage, fn_name, progress);
+    }
+    // Fire the rich callback too (if set) with the minimal info we have
+    // at this call site. Callers that want to send the full event
+    // (with current_best_ir, round, scores, ...) call report_rich_progress
+    // directly.
+    if (rich_progress_cb_) {
+        RichProgressEvent ev;
+        ev.stage = stage;
+        ev.function_name = fn_name;
+        ev.progress = progress;
+        std::lock_guard<std::mutex> lock(progress_mutex_);
+        rich_progress_cb_(ev);
+    }
+}
+
+// ── report_rich_progress (full event, for TUI / machine consumers) ─────────
+//
+// Call this from any pipeline stage that has a meaningful "current best"
+// snapshot to share. It fires the rich callback with the full event,
+// and also forwards a stripped-down version to the legacy simple
+// callback (so existing stderr progress prints keep working).
+
+void Pipeline::report_rich_progress(const RichProgressEvent& ev) {
+    if (rich_progress_cb_) {
+        std::lock_guard<std::mutex> lock(progress_mutex_);
+        rich_progress_cb_(ev);
+    }
+    if (progress_cb_) {
+        std::lock_guard<std::mutex> lock(progress_mutex_);
+        progress_cb_(ev.stage, ev.function_name, ev.progress);
     }
 }
 

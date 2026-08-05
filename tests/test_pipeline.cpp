@@ -346,15 +346,21 @@ entry:
 
     // Miner OFF: the mutation search alone cannot do this rewrite, so the
     // program is left unchanged — isolating the miner's contribution.
+    // Also disable hole_synth and algo_preprocessor (new passes that
+    // CAN find this rewrite independently of the miner) so the test
+    // continues to isolate the miner's contribution specifically.
     {
         PipelineConfig cfg;
         cfg.opt_level = 2;
         cfg.time_budget = 20.0;
         cfg.enable_peephole_miner = false;
+        cfg.enable_hole_synth = false;
+        cfg.enable_algo_preprocessor = false;
         Pipeline pipe(cfg);
         auto r = pipe.run_on_function(*fn);
         CHECK(r.optimised->blocks().front()->size() == ops_before,
-              "search alone (miner off) leaves the bit-trick unchanged");
+              "search alone (miner off, hole-synth off, algo-pre off) "
+              "leaves the bit-trick unchanged");
     }
 }
 
