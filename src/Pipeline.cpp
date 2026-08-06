@@ -126,6 +126,10 @@ PipelineResult Pipeline::run(const ir::Module& module) {
     PipelineResult result;
     auto start = std::chrono::high_resolution_clock::now();
 
+    // ── Module-level progress tracking (for the TUI progress bar) ────
+    module_start_ = std::chrono::steady_clock::now();
+    module_done_functions_.store(0, std::memory_order_relaxed);
+
     // Arm the shared wall-clock deadline. run_on_function() and the search
     // phases derive their per-round budgets from it.
     if (config_.time_budget > 0.0) {
@@ -353,6 +357,7 @@ PipelineResult Pipeline::run(const ir::Module& module) {
         }
     }
     const size_t total_fns = fns.size();
+    module_total_functions_ = total_fns;
     std::vector<PipelineResult::FunctionResult> fn_results(total_fns);
 
     // Optimise fns[i] with the given per-thread search state, or pass it
@@ -361,6 +366,27 @@ PipelineResult Pipeline::run(const ir::Module& module) {
         const ir::Function& fn = *fns[i];
         report_progress("pipeline", fn.name(),
                         static_cast<double>(i) / static_cast<double>(total_fns));
+        // Fire a "start" rich progress event so the TUI can mark this
+        // function as in-progress before any rounds run. Include the
+        // module-level progress (i/total_fns) so the TUI can render an
+        // overall progress bar.
+        if (rich_progress_cb_) {
+            RichProgressEvent ev;
+            ev.stage = "start";
+            ev.function_name = fn.name();
+            ev.progress = static_cast<double>(i) / static_cast<double>(total_fns);
+            ev.current_best_ir = fn.to_string();
+            ev.round = 0;
+            ev.improvements_adopted = 0;
+            auto orig_analysis = eval_engine_.analyse(fn);
+            ev.score_original = orig_analysis.score;
+            ev.score_current = orig_analysis.score;
+            ev.improvement_ratio = 1.0;
+            ev.verified = false;
+            ev.message = "started";
+            ev.elapsed_ms = 0.0;
+            report_rich_progress(ev);
+        }
         if (has_deadline_ && remaining_seconds() <= 0.0) {
             PipelineResult::FunctionResult r;
             r.function_name = fn.name();
@@ -369,6 +395,18 @@ PipelineResult Pipeline::run(const ir::Module& module) {
             r.score_original = eval_engine_.analyse(fn).score;
             r.score_optimised = r.score_original;
             r.improvement_ratio = 1.0;
+            // Fire a "skip" rich progress event so the TUI doesn't
+            // leave this function stuck on "pending".
+            module_done_functions_.fetch_add(1, std::memory_order_relaxed);
+            if (rich_progress_cb_) {
+                RichProgressEvent ev;
+                ev.stage = "skip";
+                ev.function_name = fn.name();
+                ev.progress = static_cast<double>(i + 1) / static_cast<double>(total_fns);
+                ev.current_best_ir = fn.to_string();
+                ev.message = "skipped (time budget exhausted)";
+                report_rich_progress(ev);
+            }
             fn_results[i] = std::move(r);
             return;
         }
@@ -451,6 +489,32 @@ PipelineResult Pipeline::run(const ir::Module& module) {
     if (nthreads <= 1) {
         for (size_t i = 0; i < total_fns; ++i) process(i, searchers_);
     } else {
+        // ── Shared thread pool for hole-synth work-stealing ───────────
+        // Create a shared pool that hole_synth_phase can attach to. The
+        // pool's workers are the "idle threads" that help search
+        // in-progress functions' codespace when enable_per_function_threads
+        // is true. The module-level function dispatch still uses the
+        // dedicated-worker pattern below (each worker has its own
+        // Searchers, pulls the next function index atomically) — the
+        // shared pool is for hole-synth subtasks only.
+        //
+        // Why not use the shared pool for function dispatch too? The
+        // dedicated-worker pattern lets each worker reuse its own
+        // Searchers across multiple functions (constructed once, used
+        // for all functions that worker processes). Using the pool
+        // would require thread_local Searchers, which works but
+        // complicates the lifetime story. The dedicated-worker pattern
+        // is simpler and proven.
+        //
+        // The shared pool has `nthreads` workers. When a dedicated
+        // worker calls hole_synth_phase, it submits subtasks to this
+        // pool. The pool's workers pick them up. When ALL pool workers
+        // are busy, the submitting dedicated worker uses run_until() to
+        // drain the queue on its own thread.
+        if (config_.enable_per_function_threads) {
+            shared_pool_ = std::make_unique<search::ThreadPool>(nthreads);
+        }
+
         // Each worker pulls the next function index and optimises it with its
         // OWN search state. The evaluator (thread-safe cache) and pattern
         // library (read-only) are shared.
@@ -480,6 +544,10 @@ PipelineResult Pipeline::run(const ir::Module& module) {
             std::cerr << "  [parallel] optimised " << total_fns << " function(s) across "
                       << nthreads << " threads\n";
         }
+
+        // Tear down the shared pool now that the dedicated workers are
+        // done — its workers are no longer needed.
+        shared_pool_.reset();
     }
 
     // Assemble the output module in module order.
@@ -758,6 +826,8 @@ PipelineResult Pipeline::run(const ir::Module& module) {
     return result;
 }
 
+Pipeline::~Pipeline() = default;
+
 // ── run_on_function ─────────────────────────────────────────────────────────
 
 PipelineResult::FunctionResult Pipeline::run_on_function(const ir::Function& fn) {
@@ -777,6 +847,17 @@ PipelineResult::FunctionResult Pipeline::run_on_function(const ir::Function& fn,
     if (fn.blocks().empty()) {
         result.optimised = std::make_shared<ir::Function>(fn);
         result.improvement_ratio = 1.0;
+        // Fire a "skip" rich progress event so the TUI doesn't leave
+        // declarations stuck on "pending".
+        module_done_functions_.fetch_add(1, std::memory_order_relaxed);
+        if (rich_progress_cb_) {
+            RichProgressEvent ev;
+            ev.stage = "skip";
+            ev.function_name = fn.name();
+            ev.progress = 1.0;
+            ev.message = "declaration (no body)";
+            report_rich_progress(ev);
+        }
         return result;
     }
 
@@ -812,6 +893,21 @@ PipelineResult::FunctionResult Pipeline::run_on_function(const ir::Function& fn,
             if (config_.verbose) {
                 std::cerr << "  [skip] " << fn.name() << " (" << inst_count
                           << " instructions > " << SKIP_THRESHOLD << ")\n";
+            }
+            // Fire a "skip" rich progress event so the TUI doesn't
+            // leave this function stuck on "pending".
+            module_done_functions_.fetch_add(1, std::memory_order_relaxed);
+            if (rich_progress_cb_) {
+                RichProgressEvent ev;
+                ev.stage = "skip";
+                ev.function_name = fn.name();
+                ev.progress = 1.0;
+                ev.current_best_ir = fn.to_string();
+                ev.message = "skipped (oversized: " +
+                             std::to_string(inst_count) + " > " +
+                             std::to_string(SKIP_THRESHOLD) + ")";
+                ev.elapsed_ms = 0.0;
+                report_rich_progress(ev);
             }
             return result;
         }
@@ -1110,6 +1206,7 @@ PipelineResult::FunctionResult Pipeline::run_on_function(const ir::Function& fn,
 
     // Fire a "done" rich progress event so the TUI can show the final
     // optimised IR for this function.
+    module_done_functions_.fetch_add(1, std::memory_order_relaxed);
     if (rich_progress_cb_) {
         RichProgressEvent ev;
         ev.stage = "done";
@@ -1517,8 +1614,16 @@ std::vector<search::Candidate> Pipeline::hole_synth_phase(const ir::Function& fn
     hcfg.trust_unverified = config_.trust_unverified ||
                             config_.skip_smt ||
                             !search::SMTVerifier::is_z3_available();
+    // Engage the work-stealing parallel path when a shared pool is
+    // available (i.e. num_threads > 1 and enable_per_function_threads).
+    // The pool is shared with module-level dispatch — idle module
+    // workers help search this function's codespace.
+    hcfg.parallel_search = config_.enable_per_function_threads;
 
     search::HoleSynthesizer synth(&eval_engine_, hcfg);
+    if (hcfg.parallel_search && shared_pool_) {
+        synth.set_thread_pool(shared_pool_.get());
+    }
     bool proven = false;
     auto rewritten = synth.synthesize(fn, &proven);
     if (!rewritten) return {};
@@ -1539,7 +1644,15 @@ std::vector<search::Candidate> Pipeline::hole_synth_phase(const ir::Function& fn
                   << synth.stats().candidates_smt_verified << " SMT-checked, "
                   << synth.stats().candidates_equivalent << " equivalent; "
                   << "best depth = " << synth.stats().best_depth
-                  << (proven ? " [proven]" : " [unproven]") << "\n";
+                  << (proven ? " [proven]" : " [unproven]");
+        if (synth.stats().parallel_depths_run > 0) {
+            std::cerr << " [parallel: " << synth.stats().parallel_depths_run
+                      << " depth(s), " << synth.stats().parallel_work_items_dispatched
+                      << " work items, ~"
+                      << synth.stats().parallel_candidates_per_work_item_avg
+                      << " cands/item]";
+        }
+        std::cerr << "\n";
     }
 
     std::vector<search::Candidate> out;
@@ -2115,13 +2228,38 @@ void Pipeline::report_progress(const std::string& stage,
 // callback (so existing stderr progress prints keep working).
 
 void Pipeline::report_rich_progress(const RichProgressEvent& ev) {
+    // Fill in the module-level fields (total/done function counts,
+    // elapsed time, time budget) so the TUI can render an overall
+    // progress bar. We make a mutable copy because the event is passed
+    // by const ref.
+    RichProgressEvent filled = ev;
+    fill_module_progress(filled);
+
     if (rich_progress_cb_) {
         std::lock_guard<std::mutex> lock(progress_mutex_);
-        rich_progress_cb_(ev);
+        rich_progress_cb_(filled);
     }
     if (progress_cb_) {
         std::lock_guard<std::mutex> lock(progress_mutex_);
-        progress_cb_(ev.stage, ev.function_name, ev.progress);
+        progress_cb_(filled.stage, filled.function_name, filled.progress);
+    }
+}
+
+// ── fill_module_progress ───────────────────────────────────────────────────
+//
+// Populates the module_* fields on a RichProgressEvent. Called on every
+// rich event so the TUI always has up-to-date module-level stats for its
+// overall progress bar.
+
+void Pipeline::fill_module_progress(RichProgressEvent& ev) {
+    ev.module_total_functions = module_total_functions_;
+    ev.module_done_functions = module_done_functions_.load(std::memory_order_relaxed);
+    if (module_start_ != std::chrono::steady_clock::time_point{}) {
+        ev.module_elapsed_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - module_start_).count();
+    }
+    if (config_.time_budget > 0.0) {
+        ev.module_time_budget_ms = config_.time_budget * 1000.0;
     }
 }
 

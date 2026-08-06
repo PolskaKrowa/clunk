@@ -86,6 +86,7 @@ struct CliOptions {
     size_t eval_threads = 0;                // --eval-threads <n>; 0 = auto
     size_t jobs = 0;                        // --jobs/-j <n>; module-level worker threads (0 = auto)
     size_t stagnation_limit = 0;            // --stagnation-limit <n>; 0 = default
+    bool no_per_function_threads = false;   // --no-per-function-threads: disable work-stealing HoleSynth
 
     // ── Scale-control flags ───────────────────────────────────────────────
     size_t max_function_size = 512;         // --max-function-size <n>
@@ -207,6 +208,8 @@ static void print_usage(const char* prog) {
               << "  --max-results <n>         Limit final candidate count\n"
               << "  --jobs, -j <n>            Worker threads to optimise functions in parallel (0 = auto)\n"
               << "  --eval-threads <n>        Worker threads for parallel eval (0 = auto)\n"
+              << "  --no-per-function-threads Disable work-stealing hole-synth (idle workers don't help\n"
+              << "                            search in-progress functions' codespace)\n"
               << "  --stagnation-limit <n>    Generations before restart (0 = default)\n"
               << "  --max-function-size <n>   Skip superoptimisation for functions larger than this (default 512)\n"
               << "  --skip-smt                Disable SMT verification entirely (sound: returns Unknown)\n"
@@ -367,6 +370,8 @@ static CliOptions parse_args(int argc, char* argv[]) {
             }
         } else if (arg == "--no-parallel-eval") {
             opts.no_parallel_eval = true;
+        } else if (arg == "--no-per-function-threads") {
+            opts.no_per_function_threads = true;
         } else if (arg == "--no-pattern-library") {
             opts.no_pattern_library = true;
         } else if (arg == "--diversity-radius") {
@@ -839,6 +844,7 @@ int main(int argc, char* argv[]) {
             std::min(config.stochastic_config.max_candidates, opts.max_results);
     }
     config.num_threads = opts.jobs;
+    config.enable_per_function_threads = !opts.no_per_function_threads;
     if (opts.eval_threads > 0) {
         config.evolutionary_config.num_eval_threads = opts.eval_threads;
     }

@@ -118,16 +118,26 @@ bool TUI::init() {
 
     getmaxyx(stdscr, rows_, cols_);
 
-    // Create the two panels. Re-create them on resize in run_loop.
+    // Layout:
+    //   ┌──────────────────────────────────────────────┐
+    //   │  list panel  │  detail panel                 │  (rows - 4 high)
+    //   │              │                               │
+    //   ├──────────────┴───────────────────────────────┤
+    //   │  Overall: [████████░░░░░░] 5/10  12.3s/30s   │  (2 high)
+    //   ├──────────────────────────────────────────────┤
+    //   │  [↑/↓] nav  [Tab/p] pin  [q] quit            │  (1 high, help)
+    //   └──────────────────────────────────────────────┘
     int list_w = std::min(40, cols_ / 3);
     int detail_w = cols_ - list_w - 2;  // -2 for the separator + borders
     if (detail_w < 10) detail_w = 10;
     int help_h = 1;
-    int panel_h = rows_ - help_h;
+    int status_h = 2;
+    int panel_h = rows_ - help_h - status_h;
     if (panel_h < 3) panel_h = 3;
 
     win_list_ = newwin(panel_h, list_w, 0, 0);
     win_detail_ = newwin(panel_h, detail_w, 0, list_w + 1);
+    win_status_ = newwin(status_h, cols_, panel_h, 0);
 
     return true;
 }
@@ -140,6 +150,20 @@ clunk::RichProgressCallback TUI::make_callback() {
 
 void TUI::handle_event(const clunk::RichProgressEvent& ev) {
     std::lock_guard<std::mutex> lock(state_.mutex);
+
+    // Update module-level progress fields (always present in every event).
+    state_.module_total_functions = ev.module_total_functions;
+    state_.module_done_functions = ev.module_done_functions;
+    state_.module_elapsed_ms = ev.module_elapsed_ms;
+    state_.module_time_budget_ms = ev.module_time_budget_ms;
+
+    // "pipeline" stage events are module-level only (no function row).
+    if (ev.stage == "pipeline") {
+        state_.last_event_stage = ev.stage;
+        state_.last_event_function = ev.function_name;
+        state_.last_event_time = std::chrono::steady_clock::now();
+        return;
+    }
 
     // Find or create the row for this function.
     auto it = state_.name_to_index.find(ev.function_name);
@@ -157,15 +181,27 @@ void TUI::handle_event(const clunk::RichProgressEvent& ev) {
 
     FunctionRow& row = state_.rows[idx];
     row.name = ev.function_name;
-    // Stages flow: pending → start → (round | vector | hole | ...) → done.
-    // Don't let a "start" overwrite a "done".
+    // Stages flow: pending → start → (round | vector | hole | ...) → done/skip.
+    // Don't let a "start" overwrite a "done"/"skip".
     if (ev.stage == "start") {
         row.stage = "start";
+        row.fn_progress = 0.05;  // just started
     } else if (ev.stage == "done") {
         row.stage = "done";
-    } else if (ev.stage != "pipeline" && ev.stage != "skip" && ev.stage != "cap") {
-        // Don't overwrite "done" with later sub-stages.
-        if (row.stage != "done") row.stage = ev.stage;
+        row.fn_progress = 1.0;
+    } else if (ev.stage == "skip") {
+        row.stage = "skip";
+        row.fn_progress = 1.0;  // skipped = complete (not pending)
+    } else if (ev.stage != "pipeline" && ev.stage != "cap") {
+        // Don't overwrite "done"/"skip" with later sub-stages.
+        if (row.stage != "done" && row.stage != "skip") {
+            row.stage = ev.stage;
+        }
+        // Update per-function progress from the round number.
+        // progress = 1 - 1/(round+2), capped at 0.99.
+        if (ev.round > 0) {
+            row.fn_progress = std::min(0.99, 1.0 - 1.0 / static_cast<double>(ev.round + 2));
+        }
     }
     if (!ev.current_best_ir.empty()) {
         row.current_best_ir = ev.current_best_ir;
@@ -250,14 +286,17 @@ void TUI::handle_key(int ch) {
         // Recreate the windows at the new size.
         if (win_list_) delwin(static_cast<WINDOW*>(win_list_));
         if (win_detail_) delwin(static_cast<WINDOW*>(win_detail_));
+        if (win_status_) delwin(static_cast<WINDOW*>(win_status_));
         int list_w = std::min(40, cols_ / 3);
         int detail_w = cols_ - list_w - 2;
         if (detail_w < 10) detail_w = 10;
         int help_h = 1;
-        int panel_h = rows_ - help_h;
+        int status_h = 2;
+        int panel_h = rows_ - help_h - status_h;
         if (panel_h < 3) panel_h = 3;
         win_list_ = newwin(panel_h, list_w, 0, 0);
         win_detail_ = newwin(panel_h, detail_w, 0, list_w + 1);
+        win_status_ = newwin(status_h, cols_, panel_h, 0);
         break;
     }
     default:
@@ -268,17 +307,25 @@ void TUI::handle_key(int ch) {
 void TUI::render() {
     std::lock_guard<std::mutex> lock(state_.mutex);
 
-    // ── Snapshot the state for rendering ─────────────────────────────
-    auto rows = state_.rows;
+    render_function_list();
+    render_detail_panel();
+    render_progress_bars();
+    render_help_bar();
+}
+
+void TUI::render_function_list() {
+    WINDOW* wl = static_cast<WINDOW*>(win_list_);
+    auto& rows = state_.rows;
     auto sel = selected_;
     bool done = state_.pipeline_done;
-    auto summary = state_.pipeline_summary;
 
-    // ── Function list (left panel) ───────────────────────────────────
-    WINDOW* wl = static_cast<WINDOW*>(win_list_);
     werase(wl);
     box(wl, 0, 0);
-    mvwprintw(wl, 0, 2, " Functions (%zu) ", rows.size());
+    // Header: show done/total count.
+    std::ostringstream hdr;
+    hdr << " Functions (" << state_.module_done_functions
+        << "/" << state_.module_total_functions << ") ";
+    mvwprintw(wl, 0, 2, "%s", hdr.str().c_str());
 
     int list_h, list_w;
     getmaxyx(wl, list_h, list_w);
@@ -298,10 +345,25 @@ void TUI::render() {
         if (is_sel) {
             wattron(wl, A_REVERSE);
         }
-        // Format: " name           [stage] ratio"
+        // Format: " >name          [stage] ratio"
+        // Show a mini progress indicator: █ for done/skip, ▓ for
+        // in-progress, ░ for pending.
+        const char* progress_char = "░";  // pending
+        if (r.stage == "done" || r.stage == "skip") {
+            progress_char = "█";
+        } else if (r.stage == "start" || r.stage == "round" ||
+                   r.stage == "patterns" || r.stage == "inline" ||
+                   r.stage == "vector" || r.stage == "hole" ||
+                   r.stage == "algo-pre" || r.stage == "mem" ||
+                   r.stage == "prune" || r.stage == "pow2" ||
+                   r.stage == "mining" || r.stage == "egraph" ||
+                   r.stage == "verify") {
+            progress_char = "▓";
+        }
         std::ostringstream ss;
         ss << (is_sel ? "> " : "  ")
-           << truncate(r.name, list_w - 18);
+           << progress_char << " "
+           << truncate(r.name, list_w - 20);
         // Pad to a fixed width so the stage tag aligns.
         std::string left = ss.str();
         while (static_cast<int>(left.size()) < list_w - 14) left += ' ';
@@ -330,9 +392,13 @@ void TUI::render() {
     }
 
     wrefresh(wl);
+}
 
-    // ── Detail panel (right) ─────────────────────────────────────────
+void TUI::render_detail_panel() {
     WINDOW* wd = static_cast<WINDOW*>(win_detail_);
+    auto& rows = state_.rows;
+    auto sel = selected_;
+
     werase(wd);
     box(wd, 0, 0);
 
@@ -343,10 +409,10 @@ void TUI::render() {
         mvwprintw(wd, detail_h / 2, (detail_w - 32) / 2,
                   "(no functions yet — waiting for pipeline)");
         wrefresh(wd);
-        render_help_bar();
         return;
     }
 
+    if (sel >= rows.size()) sel = rows.size() - 1;
     const FunctionRow& r = rows[sel];
     mvwprintw(wd, 0, 2, " %s ", r.name.c_str());
 
@@ -374,6 +440,21 @@ void TUI::render() {
     }
     mvwprintw(wd, y, 1, "%s", truncate(elapsed.str(), detail_w - 2).c_str());
     ++y;
+
+    // ── Per-function progress bar ───────────────────────────────────
+    if (r.stage != "pending") {
+        std::ostringstream fn_label;
+        fn_label << "Fn progress: ";
+        std::ostringstream fn_right;
+        if (r.stage == "done" || r.stage == "skip") {
+            fn_right << (r.stage == "done" ? "complete" : "skipped");
+        } else {
+            fn_right << static_cast<int>(r.fn_progress * 100) << "%";
+        }
+        draw_progress_bar(wd, y, 1, detail_w - 2, r.fn_progress,
+                          fn_label.str(), fn_right.str());
+        ++y;
+    }
 
     // Separator.
     mvwhline(wd, y, 1, ACS_HLINE, detail_w - 2);
@@ -407,9 +488,89 @@ void TUI::render() {
     }
 
     wrefresh(wd);
+}
 
-    // ── Help bar (bottom) ────────────────────────────────────────────
-    render_help_bar();
+void TUI::render_progress_bars() {
+    WINDOW* ws = static_cast<WINDOW*>(win_status_);
+    werase(ws);
+    box(ws, 0, 0);
+
+    int status_h, status_w;
+    getmaxyx(ws, status_h, status_w);
+    (void)status_h;  // only status_w is used below
+
+    // Overall progress bar: done/total functions.
+    double mod_frac = 0.0;
+    if (state_.module_total_functions > 0) {
+        mod_frac = static_cast<double>(state_.module_done_functions) /
+                   static_cast<double>(state_.module_total_functions);
+    }
+    if (state_.pipeline_done) mod_frac = 1.0;
+
+    std::ostringstream label;
+    label << "Overall: ";
+    std::ostringstream right;
+    right << state_.module_done_functions << "/" << state_.module_total_functions << " fns";
+    // Add time info.
+    double elapsed_s = state_.module_elapsed_ms / 1000.0;
+    if (state_.module_time_budget_ms > 0.0) {
+        double budget_s = state_.module_time_budget_ms / 1000.0;
+        right << "  " << fmt_double(elapsed_s, 1) << "s/"
+              << fmt_double(budget_s, 1) << "s";
+        // If we're over budget, show the overage in red.
+        if (elapsed_s > budget_s) {
+            right << " (OVER)";
+        }
+    } else {
+        right << "  " << fmt_double(elapsed_s, 1) << "s";
+    }
+
+    draw_progress_bar(ws, 1, 1, status_w - 2, mod_frac,
+                      label.str(), right.str());
+
+    wrefresh(ws);
+}
+
+void TUI::draw_progress_bar(void* win_ptr, int y, int x, int width,
+                             double fraction, const std::string& label,
+                             const std::string& right_text) {
+    WINDOW* win = static_cast<WINDOW*>(win_ptr);
+    if (fraction < 0.0) fraction = 0.0;
+    if (fraction > 1.0) fraction = 1.0;
+
+    // Layout: [label ][████████░░░░░░][ right_text]
+    // The bar takes whatever width is left after the label and right text.
+    int label_len = static_cast<int>(label.size());
+    int right_len = static_cast<int>(right_text.size());
+    // Minimum bar width of 10 chars; if there's not enough room, skip the bar.
+    int bar_width = width - label_len - right_len - 2;  // -2 for [ ]
+    if (bar_width < 10) {
+        // Not enough room — just print label + right_text.
+        std::string line = label + right_text;
+        mvwprintw(win, y, x, "%s", truncate(line, width).c_str());
+        return;
+    }
+
+    // Draw the label.
+    mvwprintw(win, y, x, "%s", label.c_str());
+
+    // Draw the bar: [████████░░░░░░]
+    int filled = static_cast<int>(fraction * bar_width);
+    int bar_x = x + label_len;
+    mvwaddch(win, y, bar_x, '[');
+    for (int i = 0; i < bar_width; ++i) {
+        if (i < filled) {
+            mvwaddch(win, y, bar_x + 1 + i, ACS_CKBOARD);  // █
+        } else {
+            mvwaddch(win, y, bar_x + 1 + i, '.');  // ░ (ASCII fallback)
+        }
+    }
+    mvwaddch(win, y, bar_x + 1 + bar_width, ']');
+
+    // Draw the right text.
+    if (!right_text.empty()) {
+        mvwprintw(win, y, bar_x + 1 + bar_width + 1, " %s", right_text.c_str());
+    }
 }
 
 void TUI::render_help_bar() {

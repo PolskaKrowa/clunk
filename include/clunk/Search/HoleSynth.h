@@ -66,6 +66,7 @@
 #include "clunk/IR/Function.h"
 #include "clunk/Evaluator/EvaluationEngine.h"
 #include "clunk/Search/SMTVerifier.h"
+#include "clunk/Search/ThreadPool.h"
 
 namespace clunk::search {
 
@@ -102,6 +103,44 @@ struct HoleSynthConfig {
     // this cap are skipped (the synthesiser is most effective on small
     // integer idioms where it can find a 1-2 instruction equivalent).
     size_t max_original_instructions = 32;
+
+    // ── Per-function multithreading (work-stealing) ──────────────────────
+    // When a ThreadPool is attached to the synthesiser (see
+    // set_thread_pool) AND parallel_search is true, synthesize() splits
+    // the search space at each depth into independent "first-step" work
+    // items and dispatches them to the pool. Each worker enumerates the
+    // full subtree under its claimed first step, collecting ALL verified
+    // candidates it finds (NOT short-circuiting on the first hit). When
+    // the depth is exhausted, the synthesiser picks the verified
+    // candidate with the LOWEST cost score — i.e. the fastest equivalent
+    // sequence at that depth — and returns it. If no candidate was found
+    // at depth N, the search advances to depth N+1 (the standard
+    // progressive-deepening behaviour).
+    //
+    // This implements the user's "per-function multithreading"
+    // requirement: idle threads (from finished functions or a small
+    // program) help search the in-progress function's codespace, and
+    // when multiple threads find different optimal candidates at the
+    // same depth, the score arbitrates. The depth-bounded search
+    // ensures we never miss a shorter equivalent: if depth N has any
+    // candidate, we don't look at depth N+1, even if more workers
+    // could be put to work there.
+    //
+    // The pool is OPTIONAL: when null or parallel_search is false,
+    // synthesize() runs the existing single-threaded progressive
+    // deepening. Default ON so callers that attach a pool get the
+    // parallel behaviour automatically.
+    bool parallel_search = true;
+
+    // Minimum number of "first-step" work items required to actually
+    // engage parallel search. Below this threshold the overhead of
+    // dispatching to the pool dominates, so the synthesiser runs the
+    // single-threaded path even when a pool is attached. Default 16 —
+    // roughly the work-item count of a 1-arg function at depth 1
+    // (9 opcodes × (1 arg + 16 consts)² = 9 × 17² = 2601, well above
+    // the threshold; the threshold mainly guards tiny depth-1
+    // special-case enumerations).
+    size_t parallel_min_work_items = 16;
 };
 
 class HoleSynthesizer {
@@ -115,8 +154,21 @@ public:
     // candidates scored worse than the original). `proven` (optional
     // out) is set true iff the returned rewrite carries an SMT
     // equivalence proof.
+    //
+    // When a ThreadPool is attached (see set_thread_pool) AND
+    // config_.parallel_search is true, the per-depth search is
+    // parallelised — see HoleSynthConfig::parallel_search for the
+    // semantics.
     std::shared_ptr<ir::Function> synthesize(const ir::Function& fn,
                                               bool* proven = nullptr);
+
+    // Attach a thread pool for parallel per-depth search. The pool is
+    // NOT owned by the synthesiser; the caller must keep it alive for
+    // the lifetime of the synthesiser. Passing nullptr disables
+    // parallel search (the synthesiser falls back to the
+    // single-threaded path). Safe to call between synthesize()
+    // invocations.
+    void set_thread_pool(ThreadPool* pool) { pool_ = pool; }
 
     struct Stats {
         size_t functions_seen = 0;
@@ -129,6 +181,18 @@ public:
         size_t proven = 0;                  // rewrites returned with a proof
         size_t best_depth = 0;              // depth of the returned rewrite
         double elapsed_ms = 0.0;
+
+        // ── Parallel-search statistics ────────────────────────────────
+        // When parallel_search is engaged, these report the work-stealing
+        // dispatch: `parallel_depths_run` is the number of depths that
+        // were searched in parallel; `parallel_work_items_dispatched` is
+        // the total number of first-step subtrees submitted to the pool;
+        // `parallel_candidates_per_work_item_avg` is the average subtree
+        // size (candidates_enumerated / work_items_dispatched). They are
+        // all zero on the single-threaded path.
+        size_t parallel_depths_run = 0;
+        size_t parallel_work_items_dispatched = 0;
+        double parallel_candidates_per_work_item_avg = 0.0;
     };
     const Stats& stats() const { return stats_; }
 
@@ -140,6 +204,7 @@ private:
     HoleSynthConfig config_;
     ir::TypeContext type_ctx_;
     Stats stats_{};
+    ThreadPool* pool_ = nullptr;  // optional; not owned
 };
 
 } // namespace clunk::search

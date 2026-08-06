@@ -84,6 +84,15 @@ struct FunctionRow {
     std::string message;
     double elapsed_ms = 0.0;
     std::chrono::steady_clock::time_point last_update;
+
+    // ── Per-function progress (0..1) ────────────────────────────────
+    // Driven by the pipeline's "round" events: progress is computed as
+    // 1 - 1/(round+2), so round 0 = 33%, round 1 = 50%, round 2 = 60%,
+    // etc. Capped at 0.99 until "done" (which sets it to 1.0).
+    double fn_progress = 0.0;
+
+    // ── Time budget for this function (ms, 0 = no budget) ───────────
+    double fn_time_budget_ms = 0.0;
 };
 
 // Shared state between the TUI render loop and the pipeline worker.
@@ -95,7 +104,13 @@ struct TUIState {
     std::string last_event_function;
     std::chrono::steady_clock::time_point last_event_time;
     bool pipeline_done = false;
-    std::string pipeline_summary;  // filled in when pipeline_done = true
+    std::string pipeline_summary;
+
+    // ── Module-level progress (for the overall progress bar) ────────
+    size_t module_total_functions = 0;
+    size_t module_done_functions = 0;
+    double module_elapsed_ms = 0.0;
+    double module_time_budget_ms = 0.0;
 };
 
 class TUI {
@@ -124,12 +139,23 @@ public:
 private:
     void handle_event(const clunk::RichProgressEvent& ev);
     void render();
+    void render_function_list();
+    void render_detail_panel();
+    void render_progress_bars();
     void render_help_bar();
     void handle_key(int ch);
+
+    // Draw a horizontal progress bar inside `win` at row `y`, column `x`,
+    // with the given width. `fraction` is 0..1. `label` is drawn to the
+    // left of the bar.
+    void draw_progress_bar(void* win, int y, int x, int width,
+                           double fraction, const std::string& label,
+                           const std::string& right_text = "");
 
     // ncurses window handles
     void* win_list_ = nullptr;   // left panel (function list)
     void* win_detail_ = nullptr; // right panel (current function detail)
+    void* win_status_ = nullptr; // bottom panel (overall progress bar)
     int cols_ = 0, rows_ = 0;
 
     // Selection state

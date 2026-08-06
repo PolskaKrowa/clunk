@@ -42,6 +42,7 @@
 #include "clunk/Search/VectorSynth.h"
 #include "clunk/Search/HoleSynth.h"
 #include "clunk/Search/AlgoPreprocessor.h"
+#include "clunk/Search/ThreadPool.h"
 #include "clunk/Pattern/PatternLibrary.h"
 #include "clunk/IR/StrengthReduce.h"
 
@@ -73,6 +74,27 @@ struct PipelineConfig {
     // cache) and read-only pattern library are shared; each worker gets its own
     // search RNG / stats / Z3 context.
     size_t num_threads = 0;
+
+    // ── Per-function multithreading (work-stealing) ──────────────────────
+    // When true, the pipeline's module-level worker pool is ALSO shared
+    // with the hole-synth per-depth search: idle threads (from finished
+    // functions, or a small program with fewer functions than threads)
+    // help search the in-progress function's codespace via the
+    // work-stealing HoleSynth path. Each depth's search space is split
+    // into "first-step" work items dispatched to the pool; workers
+    // collect ALL verified candidates (NOT short-circuiting on first
+    // hit) and the synthesiser picks the lowest-score one at the end
+    // of each depth. This implements the user's "per-function
+    // multithreading" requirement — when multiple threads find
+    // different optimal candidates at the same depth, the score
+    // arbitrates.
+    //
+    // Only takes effect when enable_hole_synth is true AND num_threads
+    // > 1 (the pool needs at least 2 workers for parallel dispatch).
+    // The pool's run_until() helper lets a worker that submitted
+    // subtasks participate in draining the queue, avoiding the
+    // nested-parallelism deadlock. Default ON.
+    bool enable_per_function_threads = true;
 
     // ── Continuous-refinement controls ─────────────────────────────────
     // Maximum refinement rounds per function. 0 = unlimited (bounded only
@@ -434,6 +456,12 @@ struct RichProgressEvent {
 
     // ── Elapsed time so far on this function (ms) ──────────────────────
     double elapsed_ms = 0.0;
+
+    // ── Module-level progress (for the overall progress bar) ───────────
+    size_t module_total_functions = 0;   // total functions in the module
+    size_t module_done_functions = 0;    // functions that reached done/skip
+    double module_elapsed_ms = 0.0;      // total elapsed wall-clock
+    double module_time_budget_ms = 0.0;  // 0 = no budget
 };
 
 using RichProgressCallback = std::function<void(const RichProgressEvent&)>;
@@ -442,6 +470,7 @@ using RichProgressCallback = std::function<void(const RichProgressEvent&)>;
 class Pipeline final {
 public:
     explicit Pipeline(const PipelineConfig& config = {});
+    ~Pipeline();
 
     // Run the full optimisation pipeline on a module
     PipelineResult run(const ir::Module& module);
@@ -612,6 +641,12 @@ private:
     // keep working.
     void report_rich_progress(const RichProgressEvent& ev);
 
+    // Fill in the module-level fields (total/done function counts,
+    // elapsed time, time budget) on a RichProgressEvent before
+    // dispatching it. Called by report_rich_progress and by the
+    // inline sites that build events.
+    void fill_module_progress(RichProgressEvent& ev);
+
     // ── Verbose-output throttling ─────────────────────────────────────
     // Gate for every per-round `if (config_.verbose) { std::cerr << ... }`
     // diagnostic site: returns true at most once every
@@ -653,6 +688,27 @@ private:
     // refinement round sees the true remaining budget.
     std::chrono::steady_clock::time_point deadline_{};
     bool has_deadline_ = false;
+
+    // ── Module-level progress tracking (for the TUI progress bar) ────
+    // Set at the start of run(), read by fill_module_progress() on
+    // every rich event. module_total_functions_ is the count of
+    // functions to process; module_done_functions_ is incremented
+    // whenever a function reaches "done" or "skip".
+    std::chrono::steady_clock::time_point module_start_{};
+    size_t module_total_functions_ = 0;
+    std::atomic<size_t> module_done_functions_{0};
+
+    // ── Shared thread pool (module-level + per-function) ──────────────
+    // Lazily created in run() when num_threads > 1. The pool is shared
+    // between module-level function dispatch AND the hole-synth per-
+    // depth search — so idle module-level workers (from a small program
+    // or finished functions) help search the in-progress function's
+    // codespace via the work-stealing HoleSynth path. The pool's
+    // run_until() helper lets a worker that submitted subtasks
+    // participate in draining the queue, avoiding the nested-
+    // parallelism deadlock (all N workers blocked on subtasks, no one
+    // left to run them). Null when num_threads <= 1.
+    std::unique_ptr<search::ThreadPool> shared_pool_;
 };
 
 } // namespace clunk

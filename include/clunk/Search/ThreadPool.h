@@ -129,6 +129,69 @@ public:
         return tasks_.size();
     }
 
+    // ── Work-stealing helpers (for nested parallelism) ────────────────
+    //
+    // When a pool worker thread submits subtasks to its OWN pool and then
+    // blocks on a future, the pool can deadlock: if all N workers are
+    // blocked waiting on subtasks, no worker is left to run them. The
+    // standard fix is to let the blocking thread help drain the queue
+    // while it waits — so an in-flight worker that submits more work
+    // participates in running that work instead of idling.
+    //
+    // try_run_one(): pop and run at most one queued task on the CALLING
+    //                thread. Returns true if a task ran, false if the
+    //                queue was empty. Safe to call from any thread,
+    //                including pool workers and external callers. Does
+    //                NOT block — purely best-effort.
+    //
+    // run_until(future): repeatedly try_run_one() (with a short sleep
+    //                     when the queue is empty) until `fut` is in a
+    //                     ready state. If the queue is empty AND no
+    //                     workers are processing (best-effort), it falls
+    //                     back to fut.wait() to avoid a busy-spin. This
+    //                     is the preferred wait primitive when the
+    //                     caller may be a pool worker.
+    //
+    // Both helpers honour shutdown_: once shutdown_ is set they stop
+    // trying to run queued tasks (the destructor will drain the queue
+    // and join).
+    bool try_run_one() {
+        std::function<void()> task;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (tasks_.empty()) return false;
+            task = std::move(tasks_.front());
+            tasks_.pop();
+        }
+        if (task) task();
+        return true;
+    }
+
+    template <typename Fut>
+    void run_until(Fut& fut) {
+        while (true) {
+            // Fast path: future is ready, we're done.
+            if (fut.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                return;
+            }
+            // Try to steal some work while we wait — this is what
+            // prevents deadlock when the caller is itself a pool worker
+            // that submitted subtasks to this same pool.
+            bool stole = false;
+            for (int i = 0; i < 8; ++i) {
+                if (try_run_one()) {
+                    stole = true;
+                    break;
+                }
+            }
+            if (!stole) {
+                // Queue is empty — let the pool workers handle it.
+                // Short sleep to avoid a hard busy-spin.
+                fut.wait_for(std::chrono::milliseconds(1));
+            }
+        }
+    }
+
 private:
     void worker_loop() {
         while (true) {

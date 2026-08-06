@@ -319,6 +319,203 @@ entry:
           "optimised f is no larger than the original");
 }
 
+// ── Parallel HoleSynth tests (per-function multithreading, work-stealing) ──
+
+#include "clunk/Search/ThreadPool.h"
+#include <thread>
+
+// Parallel synthesize() produces the same correct result as sequential.
+// We attach a ThreadPool and verify the rewrite is still semantically
+// equivalent to the original.
+static void test_hole_synth_parallel_correct() {
+    std::cout << "  hole-synth: parallel synthesize is correct..." << std::endl;
+    auto fn = parse_fn(R"(
+define i32 @f(i32 %x) {
+entry:
+  %a = add i32 %x, 1
+  %b = sub i32 %a, 1
+  ret i32 %b
+}
+)", "f");
+    CHECK(fn != nullptr, "parsed f");
+
+    evaluator::EvaluationEngine engine;
+    search::HoleSynthConfig cfg;
+    cfg.max_depth = 2;
+    cfg.trust_unverified = true;
+    cfg.parallel_search = true;
+    search::HoleSynthesizer synth(&engine, cfg);
+
+    // Attach a pool with 4 workers.
+    search::ThreadPool pool(4);
+    synth.set_thread_pool(&pool);
+
+    bool proven = false;
+    auto rewritten = synth.synthesize(*fn, &proven);
+
+    CHECK(rewritten != nullptr, "parallel synthesiser produced a rewrite");
+    if (!rewritten) return;
+    CHECK(synth.stats().parallel_depths_run > 0,
+          "parallel depths were run (stats recorded)");
+    CHECK(synth.stats().parallel_work_items_dispatched > 0,
+          "work items were dispatched to the pool");
+
+    // Verify equivalence on the probe set.
+    bool all_match = true;
+    for (int64_t x : {0, 1, -1, 2, 42, -100, 255, 1024}) {
+        auto o = evaluator::Interpreter::interpret(*fn, {x});
+        auto r = evaluator::Interpreter::interpret(*rewritten, {x});
+        if (!o || !r || *o != *r) { all_match = false; break; }
+    }
+    CHECK(all_match, "parallel rewrite agrees with original on probes");
+}
+
+// Parallel synthesize() with NO pool attached falls back to sequential.
+// This verifies the graceful-degradation path.
+static void test_hole_synth_parallel_no_pool_falls_back() {
+    std::cout << "  hole-synth: no pool -> sequential fallback..." << std::endl;
+    auto fn = parse_fn(R"(
+define i32 @f(i32 %x) {
+entry:
+  %r = mul i32 %x, 2
+  ret i32 %r
+}
+)", "f");
+    CHECK(fn != nullptr, "parsed f");
+
+    evaluator::EvaluationEngine engine;
+    search::HoleSynthConfig cfg;
+    cfg.max_depth = 2;
+    cfg.trust_unverified = true;
+    cfg.parallel_search = true;  // parallel enabled, but no pool attached
+    search::HoleSynthesizer synth(&engine, cfg);
+    // Don't call set_thread_pool — pool_ stays null.
+
+    bool proven = false;
+    auto rewritten = synth.synthesize(*fn, &proven);
+
+    CHECK(rewritten != nullptr, "fallback produced a rewrite");
+    if (!rewritten) return;
+    // With no pool, the parallel path is not engaged.
+    CHECK(synth.stats().parallel_depths_run == 0,
+          "no parallel depths run (no pool attached)");
+
+    bool all_match = true;
+    for (int64_t x : {0, 1, -1, 2, 42, 255}) {
+        auto o = evaluator::Interpreter::interpret(*fn, {x});
+        auto r = evaluator::Interpreter::interpret(*rewritten, {x});
+        if (!o || !r || *o != *r) { all_match = false; break; }
+    }
+    CHECK(all_match, "fallback rewrite agrees with original on probes");
+}
+
+// Parallel synthesize() finds the BEST (lowest-score) candidate at a
+// depth, not just the first. We verify this by checking that the
+// returned rewrite has a score <= the original's score (i.e. it's
+// strictly cheaper or equal — the parallel path collects ALL verified
+// candidates and picks the lowest).
+static void test_hole_synth_parallel_finds_best() {
+    std::cout << "  hole-synth: parallel finds best candidate..." << std::endl;
+    auto fn = parse_fn(R"(
+define i32 @f(i32 %x) {
+entry:
+  %a = add i32 %x, 0
+  %b = mul i32 %a, 1
+  %c = add i32 %b, 0
+  ret i32 %c
+}
+)", "f");
+    CHECK(fn != nullptr, "parsed f");
+
+    evaluator::EvaluationEngine engine;
+    auto orig_score = engine.analyse(*fn).score;
+
+    search::HoleSynthConfig cfg;
+    cfg.max_depth = 2;
+    cfg.trust_unverified = true;
+    cfg.parallel_search = true;
+    search::HoleSynthesizer synth(&engine, cfg);
+
+    search::ThreadPool pool(4);
+    synth.set_thread_pool(&pool);
+
+    bool proven = false;
+    auto rewritten = synth.synthesize(*fn, &proven);
+
+    CHECK(rewritten != nullptr, "parallel synthesiser produced a rewrite");
+    if (!rewritten) return;
+
+    auto opt_score = engine.analyse(*rewritten).score;
+    // score = -cost, so HIGHER score is BETTER. The rewrite should be
+    // at least as good as the original (opt_score >= orig_score).
+    CHECK(opt_score >= orig_score,
+          "parallel rewrite is at least as good as original");
+    // The identity function (ret %x) should be found at depth 1 — 1 instruction.
+    CHECK(rewritten->instruction_count() <= 1,
+          "parallel found the minimal (1-instruction) rewrite");
+
+    bool all_match = true;
+    for (int64_t x : {0, 1, -1, 2, 42, 255, 1024, -1024}) {
+        auto o = evaluator::Interpreter::interpret(*fn, {x});
+        auto r = evaluator::Interpreter::interpret(*rewritten, {x});
+        if (!o || !r || *o != *r) { all_match = false; break; }
+    }
+    CHECK(all_match, "best rewrite agrees with original on probes");
+}
+
+// Parallel synthesize() respects the time budget. With a very short
+// budget (0.1s), the search should terminate quickly — even if the
+// search space is large.
+static void test_hole_synth_parallel_respects_time_budget() {
+    std::cout << "  hole-synth: parallel respects time budget..." << std::endl;
+    auto fn = parse_fn(R"(
+define i32 @f(i32 %x) {
+entry:
+  %a = add i32 %x, 1
+  %b = sub i32 %a, 1
+  ret i32 %b
+}
+)", "f");
+    CHECK(fn != nullptr, "parsed f");
+
+    evaluator::EvaluationEngine engine;
+    search::HoleSynthConfig cfg;
+    cfg.max_depth = 3;  // large search space
+    cfg.time_budget_seconds = 0.1;  // very short budget
+    cfg.trust_unverified = true;
+    cfg.parallel_search = true;
+    search::HoleSynthesizer synth(&engine, cfg);
+
+    search::ThreadPool pool(4);
+    synth.set_thread_pool(&pool);
+
+    auto t0 = std::chrono::steady_clock::now();
+    bool proven = false;
+    auto rewritten = synth.synthesize(*fn, &proven);
+    auto elapsed = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - t0).count();
+
+    // The time budget is 0.1s. With the SMT timeout cap at 1/4 of the
+    // budget (25ms) plus some overhead, the total should be well under
+    // 5 seconds. (We can't be too tight because Z3 init + thread
+    // scheduling adds latency.)
+    CHECK(elapsed < 5.0, "parallel search terminates within 5s (budget=0.1s)");
+
+    // It may or may not find a rewrite in 0.1s — both are acceptable.
+    // The key check is that it DOESN'T HANG.
+    if (rewritten) {
+        bool all_match = true;
+        for (int64_t x : {0, 1, -1, 2, 42}) {
+            auto o = evaluator::Interpreter::interpret(*fn, {x});
+            auto r = evaluator::Interpreter::interpret(*rewritten, {x});
+            if (!o || !r || *o != *r) { all_match = false; break; }
+        }
+        CHECK(all_match, "time-budgeted rewrite agrees with original on probes");
+    } else {
+        CHECK(true, "no rewrite found in 0.1s (acceptable)");
+    }
+}
+
 // ── main ────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -331,6 +528,11 @@ int main() {
     test_hole_synth_out_of_scope_float();
     test_hole_synth_mul_by_two_to_shift();
     test_pipeline_hole_synth_integration();
+    std::cout << "=== Parallel HoleSynth tests ===\n";
+    test_hole_synth_parallel_correct();
+    test_hole_synth_parallel_no_pool_falls_back();
+    test_hole_synth_parallel_finds_best();
+    test_hole_synth_parallel_respects_time_budget();
     std::cout << "=== HoleSynth: " << g_pass << " passed, "
               << g_fail << " failed ===\n";
     return g_fail > 0 ? 1 : 0;
